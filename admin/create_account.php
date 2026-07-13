@@ -4,7 +4,7 @@ include "../config/db.php";
 
 // ====================== SECURITY: Only Super Admin Allowed ======================
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_role'] !== 'superadmin') {
-    $_SESSION['error'] = "Access Denied! Only The Principal can manage accounts.";
+    $_SESSION['error'] = "Access Denied! Only the Principal can manage accounts.";
     header("Location: dashboard.php");
     exit();
 }
@@ -18,6 +18,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_account'])) {
 
     if (empty($fullname) || empty($username) || empty($password) || empty($role)) {
         $_SESSION['error'] = "All fields are required!";
+    } elseif (strlen($password) < 8) {
+        $_SESSION['error'] = "Password must be at least 8 characters!";
     } else {
         $check = $conn->prepare("SELECT id FROM admins WHERE username = ?");
         $check->bind_param("s", $username);
@@ -27,12 +29,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_account'])) {
             $_SESSION['error'] = "Username already exists!";
         } else {
             $hashed_password = password_hash($password, PASSWORD_DEFAULT);
-            
             $stmt = $conn->prepare("INSERT INTO admins (fullname, username, password, role) VALUES (?, ?, ?, ?)");
             $stmt->bind_param("ssss", $fullname, $username, $hashed_password, $role);
             
             if ($stmt->execute()) {
-                $_SESSION['success'] = "New account created successfully for " . htmlspecialchars($fullname) . "!";
+                $_SESSION['success'] = "Account created for " . htmlspecialchars($fullname) . "!";
             } else {
                 $_SESSION['error'] = "Failed to create account.";
             }
@@ -51,203 +52,168 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_account'])) {
     if ($account_id == $_SESSION['admin_id']) {
         $_SESSION['error'] = "You cannot delete your own account!";
     } else {
-        $stmt = $conn->prepare("DELETE FROM admins WHERE id = ?");
-        $stmt->bind_param("i", $account_id);
+        // Prevent deleting the last superadmin
+        $count_sa = $conn->query("SELECT COUNT(*) as cnt FROM admins WHERE role='superadmin'")->fetch_assoc()['cnt'];
+        $target_role = $conn->query("SELECT role FROM admins WHERE id=$account_id")->fetch_assoc()['role'] ?? '';
         
-        if ($stmt->execute()) {
-            $_SESSION['success'] = "Account has been deleted successfully!";
+        if ($target_role === 'superadmin' && $count_sa <= 1) {
+            $_SESSION['error'] = "Cannot delete the last Super Admin account!";
         } else {
-            $_SESSION['error'] = "Failed to delete account.";
+            $stmt = $conn->prepare("DELETE FROM admins WHERE id = ?");
+            $stmt->bind_param("i", $account_id);
+            $stmt->execute() ? $_SESSION['success'] = "Account deleted!" : $_SESSION['error'] = "Failed to delete.";
+            $stmt->close();
         }
-        $stmt->close();
     }
     header("Location: create_account.php");
     exit();
 }
 
-// ====================== FETCH ALL ACCOUNTS ======================
-$result = $conn->query("SELECT id, fullname, username, role, created_at 
-                        FROM admins 
-                        ORDER BY created_at DESC");
+// ====================== FETCH ACCOUNTS ======================
+$accounts = $conn->query("SELECT id, fullname, username, role, created_at FROM admins ORDER BY created_at DESC")->fetch_all(MYSQLI_ASSOC);
+$total_accounts = count($accounts);
+$superadmin_count = count(array_filter($accounts, fn($a) => $a['role'] === 'superadmin'));
+$registrar_count = $total_accounts - $superadmin_count;
+
+$theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 'dark' : 'light';
 ?>
 
 <!DOCTYPE html>
-<html lang="en" data-bs-theme="light">
+<html lang="en" data-bs-theme="<?= $theme ?>">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Manage Accounts - USAT Admin</title>
+    <title>Accounts • USAT Admin</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
     <style>
-<style>
-    :root {
-        --bg-body: #f8f9fc;
-        --bg-card: #ffffff;
-        --text-primary: #212529;
-        --text-muted: #6c757d;
-        --border-color: #dee2e6;
-        --shadow-color: rgba(0, 0, 0, 0.08);
-        --hover-shadow: rgba(0, 0, 0, 0.15);
-    }
-
-    [data-bs-theme="dark"] {
-        --bg-body: #1a1d23;
-        --bg-card: #2b2f38;
-        --text-primary: #e9ecef;
-        --text-muted: #adb5bd;
-        --border-color: #495057;
-        --shadow-color: rgba(0, 0, 0, 0.4);
-        --hover-shadow: rgba(0, 0, 0, 0.6);
-    }
-
-    body {
-        font-family: 'Segoe UI', system-ui, sans-serif;
-        background: var(--bg-body);
-        color: var(--text-primary);
-        min-height: 100vh;
-        transition: background 0.3s ease;
-    }
-
-    .navbar {
-        background-color: var(--bg-card) !important;
-        box-shadow: 0 4px 15px var(--shadow-color);
-        border-bottom: 1px solid var(--border-color);
-    }
-
-    .main-content {
-        padding: 2rem;
-        min-height: calc(100vh - 76px);
-        padding-top: 110px;
-    }
-
-    .card, .kpi-card, .strand-card {
-        background-color: var(--bg-card);
-        border: none;
-        border-radius: 18px;
-        box-shadow: 0 6px 25px var(--shadow-color);
-        color: var(--text-primary);
-        transition: all 0.3s ease;
-    }
-
-    /* KPI Cards */
-    .kpi-card:hover {
-        transform: translateY(-8px);
-        box-shadow: 0 15px 35px var(--hover-shadow) !important;
-    }
-
-    /* Strand Cards */
-    .strand-card {
-        cursor: pointer;
-        height: 100%;
-    }
-    .strand-card:hover {
-        transform: translateY(-12px);
-        box-shadow: 0 20px 30px var(--hover-shadow) !important;
-    }
-
-    /* Text colors */
-    .text-muted {
-        color: var(--text-muted) !important;
-    }
-
-    .badge {
-        font-weight: 500;
-    }
-
-    /* Table improvements */
-    .table {
-        color: var(--text-primary);
-    }
-    .table-light {
-        background-color: var(--bg-card) !important;
-        color: var(--text-primary);
-    }
-
-    /* Alert colors adapt automatically with Bootstrap */
-</style>
+        :root {
+            --bg: #f1f5f9; --surface: #ffffff; --text: #1a1f36; --text2: #6b7280;
+            --border: #e5e7eb; --accent: #4f46e5; --accent2: #6366f1;
+            --green: #059669; --red: #dc2626; --amber: #d97706;
+            --shadow: 0 1px 3px rgba(0,0,0,0.06); --shadow-lg: 0 10px 25px rgba(0,0,0,0.08);
+            --radius: 12px; --radius-lg: 16px;
+        }
+        [data-bs-theme="dark"] {
+            --bg: #0f172a; --surface: #1e293b; --text: #f1f5f9; --text2: #94a3b8;
+            --border: #334155; --accent: #818cf8; --accent2: #6366f1;
+            --shadow: 0 1px 3px rgba(0,0,0,0.3); --shadow-lg: 0 10px 25px rgba(0,0,0,0.5);
+        }
+        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
+        body{background:var(--bg);color:var(--text);min-height:100vh}
+        
+        .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
+        .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
+        .sidebar-brand img{width:40px;height:40px;border-radius:10px}
+        .sidebar-brand span{font-weight:700;font-size:1.1rem}
+        .sidebar-nav{flex:1;padding:1rem 0.75rem;overflow-y:auto}
+        .sidebar-nav a{display:flex;align-items:center;gap:0.75rem;padding:0.7rem 1rem;border-radius:10px;color:var(--text2);text-decoration:none;font-weight:500;font-size:0.9rem;transition:all 0.2s;margin-bottom:0.25rem}
+        .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
+        .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
+        .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
+        
+        .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
+        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
+        .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
+        
+        .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem}
+        .stat-card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);box-shadow:var(--shadow);padding:1rem 1.25rem;text-align:center;transition:all 0.3s}
+        .stat-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--accent)}
+        .stat-value{font-size:1.6rem;font-weight:700;color:var(--accent)}
+        .stat-label{font-size:0.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-top:0.2rem}
+        
+        .card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);margin-bottom:1.25rem;overflow:hidden}
+        .card-header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+        .card-header h3{margin:0;font-size:0.95rem;font-weight:600;display:flex;align-items:center;gap:0.5rem}
+        .card-header h3 i{color:var(--accent)}
+        .card-body{padding:1.5rem}.card-body.no-padding{padding:0}
+        
+        .table-admin{width:100%;border-collapse:collapse}
+        .table-admin th{background:var(--bg);font-size:0.7rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;padding:0.75rem 1rem;text-align:left;border-bottom:2px solid var(--border)}
+        .table-admin td{padding:0.75rem 1rem;border-bottom:1px solid var(--border);font-size:0.85rem;vertical-align:middle}
+        .table-admin tr:hover td{background:rgba(79,70,229,0.03)}
+        .table-admin tr:last-child td{border-bottom:none}
+        
+        .badge-pill{display:inline-flex;align-items:center;gap:0.3rem;padding:0.25rem 0.7rem;border-radius:50px;font-size:0.72rem;font-weight:600}
+        .badge-pill.danger{background:#fee2e2;color:#991b1b}[data-bs-theme="dark"] .badge-pill.danger{background:#7f1d1d;color:#fca5a5}
+        .badge-pill.primary{background:#dbeafe;color:#1e40af}[data-bs-theme="dark"] .badge-pill.primary{background:#1e3a5f;color:#93c5fd}
+        
+        .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center}
+        .theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}
+        .btn{font-weight:500;border-radius:8px}
+        
+        @media(max-width:1024px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main-content{margin-left:0}.menu-toggle{display:flex}}
+        @media(max-width:640px){.main-content{padding:1rem}.stat-grid{grid-template-columns:repeat(2,1fr)}}
+    </style>
 </head>
 <body>
 
-<nav class="navbar navbar-expand-lg fixed-top top-navbar">
-    <div class="container-fluid">
-        <a class="navbar-brand" href="dashboard.php">
-            <img src="../assets/img/usat.jpg" width="42" height="42" class="rounded-circle" alt="USAT Logo">
-            USAT Admin
-        </a>
-        <div class="collapse navbar-collapse" id="navbarNav">
-            <ul class="navbar-nav me-auto gap-1">
-                <li class="nav-item"><a class="nav-link px-4" href="dashboard.php">🎓 Dashboard</a></li>
-                <li class="nav-item"><a class="nav-link px-4" href="student_profile.php">👨‍🎓Manage Student Profiles</a></li>
-                 <li class="nav-item"><a class="nav-link px-4 active" href="reports.php">📊 Reports</a></li>
-                <li class="nav-item"><a class="nav-link px-4 active" href="create_account.php">👤 Accounts</a></li>
-            </ul>
-            <div class="d-flex align-items-center gap-3">
-                <span class="badge bg-danger">Super Admin Only</span>
-                <a href="logout.php" class="btn btn-outline-danger"><i class="bi bi-box-arrow-right"></i> Logout</a>
+<aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
+    <nav class="sidebar-nav">
+        <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
+        <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
+        <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
+        <a href="create_account.php" class="active"><i class="bi bi-person-plus"></i> Accounts</a>
+    </nav>
+    <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
+</aside>
+
+<div class="main-content" id="mainContent">
+    <?php if(isset($_SESSION['success'])): ?><div class="alert alert-success alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-check-circle-fill fs-5"></i> <?= $_SESSION['success'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['success']); endif; ?>
+    <?php if(isset($_SESSION['error'])): ?><div class="alert alert-danger alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-exclamation-triangle-fill fs-5"></i> <?= $_SESSION['error'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['error']); endif; ?>
+
+    <div class="topbar">
+        <div class="d-flex align-items-center gap-3">
+            <button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button>
+            <div>
+                <h2 style="font-size:1.4rem;font-weight:700;margin:0">Admin Accounts</h2>
+                <p class="text-muted small mb-0">Super Admin access only</p>
             </div>
         </div>
+        <div class="d-flex gap-2 align-items-center">
+            <span class="badge-pill danger"><i class="bi bi-shield-lock"></i> Restricted Area</span>
+            <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+        </div>
     </div>
-</nav>
 
-<div class="container mt-5 pt-5">
-
-    <div class="d-flex justify-content-between align-items-center mb-4">
-        <h1 class="display-6 fw-bold">Manage Admin Accounts</h1>
-        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addAccountModal">
-            <i class="bi bi-plus-circle"></i> Add New Account
-        </button>
+    <!-- Stats -->
+    <div class="stat-grid">
+        <div class="stat-card"><div class="stat-value"><?= $total_accounts ?></div><div class="stat-label">Total Accounts</div></div>
+        <div class="stat-card"><div class="stat-value"><?= $superadmin_count ?></div><div class="stat-label">Super Admins</div></div>
+        <div class="stat-card"><div class="stat-value"><?= $registrar_count ?></div><div class="stat-label">Registrars</div></div>
     </div>
 
     <!-- Accounts Table -->
-    <div class="card shadow-sm">
-        <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
-            All Admin Accounts
-            <span class="text-muted small">Only Principal can manage accounts</span>
+    <div class="card">
+        <div class="card-header">
+            <h3><i class="bi bi-people"></i> All Admin Accounts</h3>
+            <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addAccountModal"><i class="bi bi-plus-lg me-1"></i> Add Account</button>
         </div>
-        <div class="table-responsive">
-            <table class="table table-hover mb-0">
-                <thead class="table-light">
-                    <tr>
-                        <th>ID</th>
-                        <th>Full Name</th>
-                        <th>Username</th>
-                        <th>Role</th>
-                        <th>Created At</th>
-                        <th class="text-center">Actions</th>
-                    </tr>
-                </thead>
+        <div class="card-body no-padding">
+            <table class="table-admin">
+                <thead><tr><th>ID</th><th>Full Name</th><th>Username</th><th>Role</th><th>Created</th><th class="text-center">Action</th></tr></thead>
                 <tbody>
-                    <?php if ($result && $result->num_rows > 0): ?>
-                        <?php while ($row = $result->fetch_assoc()): ?>
-                            <tr>
-                                <td><?= htmlspecialchars($row['id']) ?></td>
-                                <td><?= htmlspecialchars($row['fullname']) ?></td>
-                                <td><?= htmlspecialchars($row['username']) ?></td>
-                                <td>
-                                    <span class="badge <?= $row['role'] === 'superadmin' ? 'bg-danger' : 'bg-primary' ?>">
-                                        <?= ucfirst(htmlspecialchars($row['role'])) ?>
-                                    </span>
-                                </td>
-                                <td><?= htmlspecialchars($row['created_at']) ?></td>
-                                <td class="text-center">
-                                    <?php if ($row['id'] != $_SESSION['admin_id']): ?>
-                                        <form method="POST" onsubmit="return confirm('Are you sure you want to delete this account? This action cannot be undone.');" style="display:inline;">
-                                            <input type="hidden" name="account_id" value="<?= $row['id'] ?>">
-                                            <button type="submit" name="delete_account" class="btn btn-sm btn-outline-danger">
-                                                <i class="bi bi-trash"></i> Delete
-                                            </button>
-                                        </form>
-                                    <?php else: ?>
-                                        <span class="text-muted small">Current User</span>
-                                    <?php endif; ?>
-                                </td>
-                            </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
+                    <?php if(!empty($accounts)): ?>
+                        <?php foreach($accounts as $row): $is_self = $row['id'] == $_SESSION['admin_id']; ?>
                         <tr>
-                            <td colspan="6" class="text-center py-4 text-muted">No accounts found.</td>
+                            <td class="text-muted small">#<?= $row['id'] ?></td>
+                            <td class="fw-semibold"><?= htmlspecialchars($row['fullname']) ?><?= $is_self?' <span class="text-muted small">(you)</span>':'' ?></td>
+                            <td><?= htmlspecialchars($row['username']) ?></td>
+                            <td><span class="badge-pill <?= $row['role']==='superadmin'?'danger':'primary' ?>"><i class="bi bi-<?= $row['role']==='superadmin'?'shield-fill':'person-check' ?>"></i> <?= ucfirst($row['role']) ?></span></td>
+                            <td class="text-muted small"><?= date('M d, Y', strtotime($row['created_at'])) ?></td>
+                            <td class="text-center">
+                                <?php if(!$is_self): ?>
+                                    <button class="btn btn-outline-danger btn-xs" onclick="confirmDelete(<?= $row['id'] ?>,'<?= addslashes(htmlspecialchars($row['fullname'])) ?>')"><i class="bi bi-trash3 me-1"></i> Delete</button>
+                                <?php else: ?>
+                                    <span class="text-muted small">Current</span>
+                                <?php endif; ?>
+                            </td>
                         </tr>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <tr><td colspan="6" class="text-center py-4 text-muted">No accounts found.</td></tr>
                     <?php endif; ?>
                 </tbody>
             </table>
@@ -255,121 +221,59 @@ $result = $conn->query("SELECT id, fullname, username, role, created_at
     </div>
 </div>
 
-<!-- Add New Account Modal -->
-<div class="modal fade" id="addAccountModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title">Create New Admin Account</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-            </div>
+<!-- Add Account Modal -->
+<div class="modal fade" id="addAccountModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content rounded-4 border-0 shadow">
+            <div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-person-plus me-2"></i>Create New Account</h6><button class="btn-close" data-bs-dismiss="modal"></button></div>
             <form method="POST">
                 <div class="modal-body">
-                    <div class="mb-3">
-                        <label class="form-label">Full Name</label>
-                        <input type="text" name="fullname" class="form-control" required>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label">Username</label>
-                        <input type="text" name="username" class="form-control" required>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label">Password</label>
-                        <input type="password" name="password" class="form-control" required>
-                    </div>
-                    <div class="mb-3">
-                        <label class="form-label">Role</label>
+                    <div class="mb-3"><label class="form-label small fw-semibold">Full Name</label><input type="text" name="fullname" class="form-control" placeholder="e.g. Juan Dela Cruz" required></div>
+                    <div class="mb-3"><label class="form-label small fw-semibold">Username</label><input type="text" name="username" class="form-control" placeholder="e.g. juan_admin" required></div>
+                    <div class="mb-3"><label class="form-label small fw-semibold">Password</label><input type="password" name="password" class="form-control" placeholder="Min. 8 characters" minlength="8" required></div>
+                    <div class="mb-3"><label class="form-label small fw-semibold">Role</label>
                         <select name="role" class="form-select" required>
-                            <option value="superadmin">Super Admin</option>
                             <option value="registrar">Registrar</option>
+                            <option value="superadmin">Super Admin</option>
                         </select>
+                        <div class="form-text small">Super Admin has full access including account management.</div>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                    <button type="submit" name="add_account" class="btn btn-primary">Create Account</button>
-                </div>
+                <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button type="submit" name="add_account" class="btn btn-primary btn-sm">Create Account</button></div>
             </form>
         </div>
     </div>
 </div>
 
-<!-- Success / Error Popup Modal -->
-<div class="modal fade" id="resultModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-centered result-modal">
-        <div class="modal-content">
-            <div class="modal-body text-center py-5">
-                <div id="modalIcon" style="font-size: 4rem; margin-bottom: 1rem;"></div>
-                <h4 id="modalTitle" class="mb-3"></h4>
-                <p id="modalMessage" class="text-muted"></p>
-                <button type="button" class="btn btn-primary px-5 mt-3" data-bs-dismiss="modal">OK</button>
+<!-- Delete Confirmation Modal -->
+<div class="modal fade" id="deleteConfirmModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content rounded-4 border-0 shadow">
+            <div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Account</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body"><p>Delete <strong id="deleteAccountName"></strong>? This cannot be undone.</p></div>
+            <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <form method="POST" id="deleteForm"><input type="hidden" name="delete_account" value="1"><input type="hidden" name="account_id" id="deleteAccountId"><button class="btn btn-danger btn-sm">Delete</button></form>
             </div>
         </div>
     </div>
 </div>
 
+<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-
 <script>
-// Show popup message after page loads
-document.addEventListener('DOMContentLoaded', function() {
-    <?php if (isset($_SESSION['success'])): ?>
-        showPopup("success", "<?= addslashes($_SESSION['success']) ?>");
-        <?php unset($_SESSION['success']); ?>
-    <?php endif; ?>
+const sb=document.getElementById('sidebar'),ov=document.getElementById('sidebarOverlay');
+document.getElementById('menuToggle').addEventListener('click',()=>{sb.classList.toggle('open');ov.style.display=sb.classList.contains('open')?'block':'none'});
+const tb=document.getElementById('themeToggle'),ti=document.getElementById('themeIcon'),h=document.documentElement;
+function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
+(function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();
+tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
 
-    <?php if (isset($_SESSION['error'])): ?>
-        showPopup("error", "<?= addslashes($_SESSION['error']) ?>");
-        <?php unset($_SESSION['error']); ?>
-    <?php endif; ?>
-});
-
-function showPopup(type, message) {
-    const modal = new bootstrap.Modal(document.getElementById('resultModal'));
-    const icon = document.getElementById('modalIcon');
-    const title = document.getElementById('modalTitle');
-    const msg = document.getElementById('modalMessage');
-
-    if (type === "success") {
-        icon.innerHTML = '✅';
-        icon.style.color = '#198754';
-        title.textContent = "Success!";
-        title.style.color = '#198754';
-    } else {
-        icon.innerHTML = '⚠️';
-        icon.style.color = '#dc3545';
-        title.textContent = "Error";
-        title.style.color = '#dc3545';
-    }
-
-    msg.textContent = message;
-    modal.show();
+function confirmDelete(id, name) {
+    document.getElementById('deleteAccountId').value = id;
+    document.getElementById('deleteAccountName').textContent = name;
+    new bootstrap.Modal(document.getElementById('deleteConfirmModal')).show();
 }
-
-// Theme Toggle (Improved)
-const toggleBtn = document.getElementById('themeToggle');
-const themeIcon = document.getElementById('themeIcon');
-const html = document.documentElement;
-
-function setTheme(theme) {
-    html.setAttribute('data-bs-theme', theme);
-    if (theme === 'dark') {
-        themeIcon.classList.replace('bi-sun-fill', 'bi-moon-fill');
-    } else {
-        themeIcon.classList.replace('bi-moon-fill', 'bi-sun-fill');
-    }
-    localStorage.setItem('theme', theme);
-}
-
-// Load saved theme
-const savedTheme = localStorage.getItem('theme') || 'light';
-setTheme(savedTheme);
-
-toggleBtn.addEventListener('click', () => {
-    const currentTheme = html.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark';
-    setTheme(currentTheme);
-});
 </script>
-
 </body>
 </html>

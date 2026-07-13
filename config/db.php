@@ -4,7 +4,7 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 // Database configuration
-define('DB_HOST', '10.0.31.5');
+define('DB_HOST', '10.176.37.160');
 define('DB_USER', 'usat_admin'); 
 define('DB_PASS', 'abc_123'); 
 define('DB_NAME', 'enrollment_profiling_db'); 
