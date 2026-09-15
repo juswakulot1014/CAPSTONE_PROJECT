@@ -1,7 +1,4 @@
 <?php
-session_start();
-if (!isset($_SESSION['admin'])) {
-    header("Location: admin_login.php");
-    exit();
-}
-?>
+require_once __DIR__ . '/config/security.php';
+secure_session_start();
+require_admin();

@@ -169,7 +169,16 @@ $fields = [
     'is_4ps' => ['required' => true]
 ];
 
+// ------------------------------------------------------------------
+// POST handling with CSRF validation and file processing
+// ------------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // CSRF check
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+        die('Invalid CSRF token');
+    }
+
+    // Validation of basic fields
     foreach ($fields as $f => $rules) {
         $val = $_POST[$f] ?? '';
         if ($f === 'is_4ps') {
@@ -186,6 +195,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    // Age calculation
     if (!empty($_POST['birth_date'])) {
         $birth = new DateTime($_POST['birth_date']);
         $today = new DateTime();
@@ -196,12 +206,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $_POST['age'] = $age;
     }
 
+    // Phone number validation
     foreach (['phone', 'father_contact', 'mother_contact', 'guardian_contact'] as $field) {
         if (!empty($_POST[$field]) && !preg_match('/^09\d{9}$/', $_POST[$field])) {
             $errors[$field] = $t[$lang]['invalid_phone'];
         }
     }
 
+    // Entrance data selection
     if (empty($_POST['entrance_data'] ?? [])) {
         $errors['entrance_data'] = $t[$lang]['select_one_entrance'];
     }
@@ -210,53 +222,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors['email'] = $t[$lang]['invalid_email'];
     }
 
-    // Handle file uploads + camera captures for entrance documents
+    // --------------------------------------------
+    // File upload processing (store as base64 in session)
+    // --------------------------------------------
     $uploaded_files = [];
     if (empty($errors)) {
-        $allowed = ['pdf', 'jpg', 'jpeg', 'png'];
-        $upload_dir = __DIR__ . "/../uploads/enrollment_docs/";
-        if (!is_dir($upload_dir)) mkdir($upload_dir, 0755, true);
-        
-        // Process regular file uploads
-        if (!empty($_FILES['entrance_files']['name'][0])) {
+        $allowed_ext = ['pdf', 'jpg', 'jpeg', 'png'];
+        $allowed_mime = ['application/pdf', 'image/jpeg', 'image/png'];
+        $max_file_size = 5 * 1024 * 1024; // 5 MB
+
+        // Process regular file uploads - FIXED: loop through all files, not just first
+        if (isset($_FILES['entrance_files']) && is_array($_FILES['entrance_files']['name'])) {
             foreach ($_FILES['entrance_files']['name'] as $i => $name) {
-                if ($_FILES['entrance_files']['error'][$i] === 0 && !empty($name)) {
-                    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-                    if (in_array($ext, $allowed)) {
-                        $doc_label = $_POST['entrance_file_labels'][$i] ?? 'document_' . ($i + 1);
-                        $safe_label = preg_replace('/[^a-zA-Z0-9_-]/', '_', $doc_label);
-                        $new_name = "enroll_" . time() . "_{$i}_" . $safe_label . "." . $ext;
-                        $target = $upload_dir . $new_name;
-                        
-                        if (move_uploaded_file($_FILES['entrance_files']['tmp_name'][$i], $target)) {
-                            $uploaded_files[] = ['label' => $doc_label, 'path' => "uploads/enrollment_docs/" . $new_name];
-                        }
-                    }
+                // Skip empty or errored uploads
+                if ($_FILES['entrance_files']['error'][$i] !== UPLOAD_ERR_OK || empty($name)) {
+                    continue;
                 }
+                
+                $tmp_name = $_FILES['entrance_files']['tmp_name'][$i];
+                $file_size = $_FILES['entrance_files']['size'][$i];
+                $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                $mime = finfo_file($finfo, $tmp_name);
+                finfo_close($finfo);
+
+                if (!in_array($ext, $allowed_ext) || !in_array($mime, $allowed_mime)) {
+                    $errors['upload'] = "Invalid file type: " . htmlspecialchars($name);
+                    break;
+                }
+                if ($file_size > $max_file_size) {
+                    $errors['upload'] = "File too large: " . htmlspecialchars($name);
+                    break;
+                }
+
+                $doc_label = $_POST['entrance_file_labels'][$i] ?? 'document_' . ($i + 1);
+                // Read file content and encode as base64 for session storage
+                $file_content = file_get_contents($tmp_name);
+                $base64_data = base64_encode($file_content);
+
+                $uploaded_files[] = [
+                    'label' => $doc_label,
+                    'data'  => $base64_data,
+                    'mime'  => $mime,
+                    'name'  => $name
+                ];
             }
         }
-        
-        // Process camera captures (base64 images)
-        if (!empty($_POST['camera_data'])) {
+
+        // Process camera captures (base64)
+        if (!empty($_POST['camera_data']) && !isset($errors['upload'])) {
             foreach ($_POST['camera_data'] as $i => $data) {
-                if (!empty($data) && strpos($data, 'data:image/') === 0) {
-                    $img_data = substr($data, strpos($data, ',') + 1);
-                    $img_data = base64_decode($img_data);
-                    if ($img_data !== false) {
-                        $doc_label = $_POST['camera_labels'][$i] ?? 'captured_' . ($i + 1);
-                        $safe_label = preg_replace('/[^a-zA-Z0-9_-]/', '_', $doc_label);
-                        $new_name = "capture_" . time() . "_{$i}_" . $safe_label . ".jpg";
-                        $target = $upload_dir . $new_name;
-                        
-                        if (file_put_contents($target, $img_data)) {
-                            $uploaded_files[] = ['label' => $doc_label, 'path' => "uploads/enrollment_docs/" . $new_name];
-                        }
-                    }
-                }
+                if (empty($data) || strpos($data, 'data:image/') !== 0) continue;
+
+                // Extract base64 part after comma
+                $img_data = substr($data, strpos($data, ',') + 1);
+                // Validate it's a valid base64 image
+                if (base64_decode($img_data, true) === false) continue;
+
+                $doc_label = $_POST['camera_labels'][$i] ?? 'captured_' . ($i + 1);
+                $uploaded_files[] = [
+                    'label' => $doc_label,
+                    'data'  => $img_data, // already base64, no need to re-encode
+                    'mime'  => 'image/jpeg',
+                    'name'  => $doc_label . '.jpg'
+                ];
             }
         }
     }
 
+    // If no errors, proceed to review
     if (empty($errors)) {
         $_SESSION['form_data'] = $_POST;
         $_SESSION['uploaded_files'] = $uploaded_files;
@@ -265,20 +299,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } else {
         $_SESSION['errors'] = $errors;
         $_SESSION['old'] = $_POST;
+        // Keep uploaded files in session to repopulate if editing later
+        if (!empty($uploaded_files)) {
+            $_SESSION['uploaded_files_temp'] = $uploaded_files;
+        }
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
 }
 
-// Handle edit and review modes
+// ----------------------------------------------------------------
+// Display modes: form, review, edit
+// ----------------------------------------------------------------
 if (isset($_GET['edit'])) {
     $mode = 'form';
     if (isset($_SESSION['form_data'])) {
         $_POST = $_SESSION['form_data'];
+        // Restore uploaded files for display (if any)
+        if (isset($_SESSION['uploaded_files'])) {
+            $_SESSION['uploaded_files_temp'] = $_SESSION['uploaded_files'];
+        }
     }
 } elseif (isset($_GET['review']) && isset($_SESSION['form_data'])) {
     $mode = 'review';
     $_POST = $_SESSION['form_data'];
+    // uploaded_files are already in session
 } else {
     $mode = 'form';
     if (isset($_SESSION['old'])) {
@@ -289,9 +334,13 @@ if (isset($_GET['edit'])) {
         $errors = $_SESSION['errors'];
         unset($_SESSION['errors']);
     }
+    // If we have temporary uploaded files from a previous attempt, restore them
+    if (isset($_SESSION['uploaded_files_temp']) && !isset($_SESSION['uploaded_files'])) {
+        $_SESSION['uploaded_files'] = $_SESSION['uploaded_files_temp'];
+    }
 }
 
-// Prepare educational history data for form re-population
+// Prepare educational history
 $edu_history = [];
 if (isset($_POST['edu_level']) && is_array($_POST['edu_level'])) {
     foreach ($_POST['edu_level'] as $i => $level) {
@@ -306,8 +355,18 @@ if (isset($_POST['edu_level']) && is_array($_POST['edu_level'])) {
 if (empty($edu_history)) {
     $edu_history[] = ['level' => 'Elementary', 'school_name' => '', 'school_address' => '', 'year_completed' => ''];
 }
-?>
 
+// Pre-fill uploaded files display for edit mode
+$display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'] : [];
+
+// Define entrance document options with their keys for the upload rows
+$doc_options = [
+    'Good Moral Certificate' => 'good_moral',
+    'Junior High School Certificate (Original)' => 'jhs_certificate',
+    'NSO/PSA Birth Certificate (Original)' => 'birth_certificate',
+    '2 pcs 2×2 picture' => 'pictures_2x2'
+];
+?>
 <!DOCTYPE html>
 <html lang="<?= $lang ?>">
 <head>
@@ -360,12 +419,14 @@ if (empty($edu_history)) {
         .progress-step.active .step-number{background:#1e88e5;color:white;box-shadow:0 0 0 3px rgba(30,136,229,0.3)}
         .upload-row{border:1px solid #e5e7eb;border-radius:12px;padding:1rem;margin-bottom:0.75rem;background:#fafbfc;position:relative}
         .preview-thumb{width:80px;height:60px;object-fit:cover;border-radius:8px;border:2px solid #e5e7eb}
-        /* Camera Modal */
         .camera-modal{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.9);display:flex;align-items:center;justify-content:center}
         .camera-container{background:#000;border-radius:16px;overflow:hidden;max-width:600px;width:95%}
         .camera-container video{width:100%;display:block}
         .camera-container .camera-controls{padding:1rem;display:flex;gap:0.75rem;justify-content:center;background:#111}
         .camera-container .camera-controls button{padding:0.6rem 1.5rem;border-radius:50px;font-weight:600}
+        /* New style for document upload rows hidden by default */
+        .doc-upload-row{display:none; margin-top:0.5rem; padding-left:1rem; border-left:3px solid #0d6efd;}
+        .doc-upload-row.visible{display:block;}
     </style>
 </head>
 <body>
@@ -394,6 +455,7 @@ if (empty($edu_history)) {
         </div>
 
         <form method="POST" action="" id="enrollForm" enctype="multipart/form-data" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
 
             <!-- STUDENT INFORMATION -->
             <div class="section-card" data-section="1">
@@ -474,31 +536,82 @@ if (empty($edu_history)) {
                 <div id="transferee-fields" class="transferee-section" style="display:<?= !empty($_POST['is_transferred']) ? 'block' : 'none' ?>"><div class="row g-3"><div class="col-md-6 form-group"><input type="text" name="previous_school_name" placeholder=" " value="<?= htmlspecialchars($_POST['previous_school_name'] ?? '') ?>"><label><?= $t[$lang]['prev_school_name'] ?></label></div><div class="col-md-6 form-group"><textarea name="previous_school_address" rows="2" placeholder=" "><?= htmlspecialchars($_POST['previous_school_address'] ?? '') ?></textarea><label><?= $t[$lang]['prev_school_address'] ?></label></div><div class="col-md-4 form-group"><input type="text" name="previous_track" placeholder=" " value="<?= htmlspecialchars($_POST['previous_track'] ?? '') ?>"><label><?= $t[$lang]['prev_track'] ?></label></div><div class="col-md-4 form-group"><input type="text" name="previous_strand" placeholder=" " value="<?= htmlspecialchars($_POST['previous_strand'] ?? '') ?>"><label><?= $t[$lang]['prev_strand'] ?></label></div><div class="col-md-4 form-group"><input type="text" name="previous_program" placeholder=" " value="<?= htmlspecialchars($_POST['previous_program'] ?? '') ?>"><label><?= $t[$lang]['prev_program'] ?></label></div><div class="col-md-4 form-group"><input type="number" name="previous_year_completed" placeholder=" " value="<?= htmlspecialchars($_POST['previous_year_completed'] ?? '') ?>" min="2000" max="<?= date('Y') ?>"><label><?= $t[$lang]['prev_year_completed'] ?></label></div></div><div class="mt-4"><label class="form-label fw-bold mb-2"><?= $t[$lang]['voucher_qualified'] ?></label><div class="d-flex gap-4"><div class="form-check"><input class="form-check-input" type="radio" name="voucher_qualified" id="vq_yes" value="1" <?= ($_POST['voucher_qualified'] ?? '') == '1' ? 'checked' : '' ?>><label class="form-check-label" for="vq_yes"><?= $t[$lang]['qualified_voucher'] ?></label></div><div class="form-check"><input class="form-check-input" type="radio" name="voucher_qualified" id="vq_no" value="0" <?= ($_POST['voucher_qualified'] ?? '') == '0' ? 'checked' : '' ?>><label class="form-check-label" for="vq_no"><?= $t[$lang]['not_qualified_voucher'] ?></label></div></div></div></div></div>
             </div>
 
-            <!-- ENTRANCE DOCUMENTS WITH FILE UPLOAD & CAMERA CAPTURE -->
+            <!-- ENTRANCE DOCUMENTS (with dynamic upload rows - NO ADDITIONAL DOCUMENTS SECTION) -->
             <div class="section-card">
                 <div class="section-header"><i class="fas fa-folder-open"></i><h2><?= $t[$lang]['entrance_data'] ?></h2></div>
+                
+                <!-- Checkboxes -->
                 <div class="checkbox-container">
-                    <div class="checkbox-item"><input type="checkbox" name="entrance_data[]" value="Good Moral Certificate" id="gm" <?= in_array('Good Moral Certificate', $_POST['entrance_data'] ?? []) ? 'checked' : '' ?>><label for="gm"><i class="fas fa-scroll me-2 text-primary"></i><?= $t[$lang]['good_moral'] ?></label></div>
-                    <div class="checkbox-item"><input type="checkbox" name="entrance_data[]" value="Junior High School Certificate (Original)" id="jhs" <?= in_array('Junior High School Certificate (Original)', $_POST['entrance_data'] ?? []) ? 'checked' : '' ?>><label for="jhs"><i class="fas fa-certificate me-2 text-primary"></i><?= $t[$lang]['jhs_certificate'] ?></label></div>
-                    <div class="checkbox-item"><input type="checkbox" name="entrance_data[]" value="NSO/PSA Birth Certificate (Original)" id="bc" <?= in_array('NSO/PSA Birth Certificate (Original)', $_POST['entrance_data'] ?? []) ? 'checked' : '' ?>><label for="bc"><i class="fas fa-baby-carriage me-2 text-primary"></i><?= $t[$lang]['birth_certificate'] ?></label></div>
-                    <div class="checkbox-item"><input type="checkbox" name="entrance_data[]" value="2 pcs 2×2 picture" id="pic" <?= in_array('2 pcs 2×2 picture', $_POST['entrance_data'] ?? []) ? 'checked' : '' ?>><label for="pic"><i class="fas fa-camera me-2 text-primary"></i><?= $t[$lang]['pictures_2x2'] ?></label></div>
+                    <?php foreach ($doc_options as $doc_name => $doc_key): ?>
+                        <div class="checkbox-item">
+                            <input type="checkbox" name="entrance_data[]" value="<?= htmlspecialchars($doc_name) ?>" id="<?= $doc_key ?>" 
+                                <?= in_array($doc_name, $_POST['entrance_data'] ?? []) ? 'checked' : '' ?>>
+                            <label for="<?= $doc_key ?>"><i class="fas fa-check-circle me-2 text-primary"></i><?= $t[$lang][$doc_key] ?></label>
+                        </div>
+                    <?php endforeach; ?>
                 </div>
                 <?php if(isset($errors['entrance_data'])): ?><span class="error-msg"><i class="fas fa-exclamation-triangle me-1"></i><?= $errors['entrance_data'] ?></span><?php endif; ?>
-
-                <!-- FILE UPLOAD & CAMERA CAPTURE SECTION -->
-                <div class="mt-4 pt-3 border-top">
-                    <h5 class="fw-bold mb-3"><i class="fas fa-cloud-upload-alt me-2 text-primary"></i><?= $t[$lang]['upload_docs'] ?> <small class="text-muted fw-normal">(Optional)</small></h5>
-                    <div id="uploadContainer">
-                        <div class="upload-row row g-3 align-items-end" data-row="0">
-                            <div class="col-md-4"><label class="form-label small fw-semibold">Document Label</label><input type="text" name="entrance_file_labels[]" class="form-control" placeholder="e.g., Good Moral Certificate"></div>
-                            <div class="col-md-3"><label class="form-label small fw-semibold">Upload File</label><input type="file" name="entrance_files[]" class="form-control" accept=".pdf,.jpg,.jpeg,.png" onchange="previewFile(this)"></div>
-                            <div class="col-md-3"><label class="form-label small fw-semibold">or Capture</label><button type="button" class="btn btn-capture btn-sm w-100" onclick="openCamera(0)"><i class="fas fa-camera me-1"></i> <?= $t[$lang]['capture'] ?></button></div>
-                            <div class="col-md-2"><div class="preview-thumb" id="preview0" style="display:none"><img src="" class="preview-thumb" id="previewImg0"></div><input type="hidden" name="camera_data[]" id="cameraData0"><input type="hidden" name="camera_labels[]" id="cameraLabel0"></div>
-                        </div>
+                <?php if(isset($errors['upload'])): ?>
+                    <div class="alert alert-danger mt-2">
+                        <i class="fas fa-exclamation-triangle me-1"></i><?= htmlspecialchars($errors['upload']) ?>
                     </div>
-                    <button type="button" class="btn btn-outline-primary btn-sm mt-2" id="addUploadRow"><i class="fas fa-plus me-1"></i> Add Another Document</button>
-                    <div class="form-text mt-1">Upload scanned copies or capture photos of your entrance documents using your camera.</div>
+                <?php endif; ?>
+
+                <!-- Upload rows for each document (hidden by default, shown when checkbox checked) -->
+                <div class="mt-3">
+                    <?php foreach ($doc_options as $doc_name => $doc_key): 
+                        // Check if this document was selected and we have a previously uploaded file for it (for edit mode)
+                        $has_upload = false;
+                        $file_info = null;
+                        if (!empty($display_files)) {
+                            foreach ($display_files as $f) {
+                                if ($f['label'] === $doc_name) {
+                                    $has_upload = true;
+                                    $file_info = $f;
+                                    break;
+                                }
+                            }
+                        }
+                        // Determine if this row should be visible: either checkbox checked or has existing upload
+                        $is_checked = in_array($doc_name, $_POST['entrance_data'] ?? []);
+                        $show_row = $is_checked || $has_upload;
+                    ?>
+                        <div class="doc-upload-row <?= $show_row ? 'visible' : '' ?>" id="uploadRow_<?= $doc_key ?>">
+                            <div class="upload-row row g-3 align-items-end">
+                                <div class="col-md-4">
+                                    <label class="form-label small fw-semibold">Document Label</label>
+                                    <input type="text" name="entrance_file_labels[]" class="form-control" value="<?= htmlspecialchars($doc_name) ?>" readonly>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label small fw-semibold">Upload File</label>
+                                    <input type="file" name="entrance_files[]" class="form-control" accept=".pdf,.jpg,.jpeg,.png" 
+                                           <?php if ($has_upload): ?>disabled style="background:#e9ecef"<?php endif; ?>>
+                                    <?php if ($has_upload): ?>
+                                        <small class="text-success"><i class="fas fa-check-circle"></i> Already uploaded</small>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="col-md-3">
+                                    <label class="form-label small fw-semibold">or Capture</label>
+                                    <button type="button" class="btn btn-capture btn-sm w-100" onclick="openCamera('<?= $doc_key ?>')"><i class="fas fa-camera me-1"></i> <?= $t[$lang]['capture'] ?></button>
+                                </div>
+                                <div class="col-md-2">
+                                    <?php if ($has_upload): ?>
+                                        <a href="#" class="badge bg-success" onclick="return false;"><i class="fas fa-check-circle"></i> Uploaded</a>
+                                        <!-- hidden inputs to pass existing file info if not overwritten -->
+                                        <input type="hidden" name="existing_file[<?= $doc_key ?>][label]" value="<?= htmlspecialchars($file_info['label']) ?>">
+                                        <input type="hidden" name="existing_file[<?= $doc_key ?>][data]" value="<?= htmlspecialchars($file_info['data']) ?>">
+                                        <input type="hidden" name="existing_file[<?= $doc_key ?>][mime]" value="<?= htmlspecialchars($file_info['mime']) ?>">
+                                        <input type="hidden" name="existing_file[<?= $doc_key ?>][name]" value="<?= htmlspecialchars($file_info['name']) ?>">
+                                    <?php endif; ?>
+                                    <div class="preview-thumb" id="preview_<?= $doc_key ?>" style="display:none"><img src="" class="preview-thumb" id="previewImg_<?= $doc_key ?>"></div>
+                                    <input type="hidden" name="camera_data[]" id="cameraData_<?= $doc_key ?>" value="">
+                                    <input type="hidden" name="camera_labels[]" id="cameraLabel_<?= $doc_key ?>" value="<?= htmlspecialchars($doc_name) ?>">
+                                </div>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
                 </div>
+                <!-- END: No Additional Documents section -->
             </div>
 
             <div class="text-center mt-5 mb-4">
@@ -515,11 +628,34 @@ if (empty($edu_history)) {
             <div class="review-section"><h3><i class="fas fa-map-marker-alt me-2"></i><?= $t[$lang]['address'] ?></h3><div class="review-grid"><?php foreach(['purok_street'=>'Purok/Street','barangay'=>'Barangay','town_city'=>'Town/City','province'=>'Province','region'=>'Region','district'=>'District','postal_code'=>'Postal Code'] as $k=>$l): ?><div class="review-item"><strong><?= $l ?>:</strong> <?= htmlspecialchars($_POST[$k] ?? '—') ?></div><?php endforeach; ?></div></div>
             <div class="review-section"><h3><i class="fas fa-graduation-cap me-2"></i><?= $t[$lang]['education'] ?></h3><?php if(isset($_POST['edu_level'])&&is_array($_POST['edu_level'])):foreach($_POST['edu_level'] as $i=>$level): ?><div style="margin-bottom:1rem;padding:1rem;background:white;border-radius:8px"><strong><?= htmlspecialchars($level) ?></strong><br>School: <?= htmlspecialchars($_POST['school_name'][$i]??'—') ?><br>Address: <?= htmlspecialchars($_POST['school_address'][$i]??'—') ?><br>Year: <?= htmlspecialchars($_POST['year_completed'][$i]??'—') ?></div><?php endforeach;else: ?><p class="text-muted">No educational history.</p><?php endif; ?></div>
             <div class="review-section"><h3><i class="fas fa-clipboard-list me-2"></i><?= $t[$lang]['enrollment'] ?></h3><div class="review-grid"><?php foreach(['school_year'=>'School Year','grade_level'=>'Grade Level','semester'=>'Semester','track'=>'Track','strand'=>'Strand','program'=>'Program','household_id'=>'Household ID'] as $k=>$l): ?><div class="review-item"><strong><?= $l ?>:</strong> <?= htmlspecialchars($_POST[$k] ?? '—') ?></div><?php endforeach; ?></div><?php if(!empty($_POST['is_transferred'])): ?><hr class="my-3"><h4 class="text-primary"><?= $t[$lang]['transferred_in'] ?></h4><div class="review-grid"><?php foreach(['previous_school_name'=>'Previous School','previous_school_address'=>'Previous Address','previous_track'=>'Previous Track','previous_strand'=>'Previous Strand','previous_program'=>'Previous Program','previous_year_completed'=>'Year Completed'] as $k=>$l): ?><div class="review-item"><strong><?= $l ?>:</strong> <?= htmlspecialchars($_POST[$k] ?? '—') ?></div><?php endforeach; ?><div class="review-item"><strong>Voucher:</strong> <?php $vq=$_POST['voucher_qualified']??'';echo $vq==='1'?$t[$lang]['qualified_voucher']:($vq==='0'?$t[$lang]['not_qualified_voucher']:'—'); ?></div></div><?php endif; ?></div>
-            <div class="review-section"><h3><i class="fas fa-folder-open me-2"></i><?= $t[$lang]['entrance_data'] ?></h3><ul class="list-unstyled"><?php if(!empty($_POST['entrance_data']??[])):foreach($_POST['entrance_data'] as $d):echo "<li class='mb-2'><i class='fas fa-check-circle text-success me-2'></i>".htmlspecialchars($d)."</li>";endforeach;else:echo"<li class='text-muted'>None selected</li>";endif; ?></ul><?php if(!empty($_SESSION['uploaded_files'])): ?><h5 class="mt-3"><i class="fas fa-paperclip me-2"></i>Uploaded Files</h5><ul class="list-unstyled"><?php foreach($_SESSION['uploaded_files'] as $f): echo "<li class='mb-1'><i class='fas fa-file text-primary me-2'></i>".htmlspecialchars($f['label'])."</li>";endforeach; ?></ul><?php endif; ?></div>
+            <div class="review-section"><h3><i class="fas fa-folder-open me-2"></i><?= $t[$lang]['entrance_data'] ?></h3><ul class="list-unstyled"><?php if(!empty($_POST['entrance_data']??[])):foreach($_POST['entrance_data'] as $d):echo "<li class='mb-2'><i class='fas fa-check-circle text-success me-2'></i>".htmlspecialchars($d)."</li>";endforeach;else:echo"<li class='text-muted'>None selected</li>";endif; ?></ul>
+                <?php if(!empty($_SESSION['uploaded_files'])): ?>
+                    <h5 class="mt-3"><i class="fas fa-paperclip me-2"></i>Uploaded Files</h5>
+                    <ul class="list-unstyled">
+                        <?php foreach($_SESSION['uploaded_files'] as $f): ?>
+                            <li class="mb-1"><i class="fas fa-file text-primary me-2"></i><?= htmlspecialchars($f['label']) ?> 
+                                <span class="badge bg-light text-dark">(<?= $f['mime'] ?>)</span>
+                            </li>
+                        <?php endforeach; ?>
+                    </ul>
+                <?php endif; ?>
+            </div>
 
+            <!-- IMPORTANT: No hidden fields for uploaded_files are sent; process_enroll.php reads from session -->
             <form method="POST" action="process_enroll.php" class="text-center mt-5">
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
-                <?php foreach($_POST as $k=>$v): ?><?php if(is_array($v)): ?><?php foreach($v as $val): ?><input type="hidden" name="<?= htmlspecialchars($k) ?>[]" value="<?= htmlspecialchars($val) ?>"><?php endforeach; ?><?php else: ?><input type="hidden" name="<?= htmlspecialchars($k) ?>" value="<?= htmlspecialchars($v) ?>"><?php endif; ?><?php endforeach; ?>
+                <?php foreach($_POST as $k=>$v): ?>
+                    <?php if(is_array($v)): ?>
+                        <?php foreach($v as $val): ?>
+                            <input type="hidden" name="<?= htmlspecialchars($k) ?>[]" value="<?= htmlspecialchars($val) ?>">
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <input type="hidden" name="<?= htmlspecialchars($k) ?>" value="<?= htmlspecialchars($v) ?>">
+                    <?php endif; ?>
+                <?php endforeach; ?>
+
+                <!-- No uploaded_files hidden fields -->
+
                 <button type="submit" class="btn btn-submit btn-custom px-5"><i class="fas fa-save me-2"></i> Confirm & Save Enrollment</button>
             </form>
             <div class="text-center mt-3"><a href="?edit=1" class="btn btn-back btn-custom px-4"><i class="fas fa-edit me-2"></i> Edit</a></div>
@@ -555,29 +691,100 @@ document.getElementById('addEduBtn')?.addEventListener('click',addEdu);
 const tc=document.getElementById('is_transferred'),ts=document.getElementById('transferee-fields');
 if(tc&&ts){const tg=()=>{ts.style.display=tc.checked?'block':'none';if(tc.checked)initFloatingLabels(ts)};tc.addEventListener('change',tg);window.addEventListener('load',tg)}
 
-// Upload row management
-let rowCount=1;
-document.getElementById('addUploadRow')?.addEventListener('click',function(){
-    const c=document.getElementById('uploadContainer'),r=document.createElement('div');
-    r.className='upload-row row g-3 align-items-end';r.setAttribute('data-row',rowCount);
-    r.innerHTML=`
-        <div class="col-md-4"><label class="form-label small fw-semibold">Document Label</label><input type="text" name="entrance_file_labels[]" class="form-control" placeholder="e.g., Good Moral Certificate"></div>
-        <div class="col-md-3"><label class="form-label small fw-semibold">Upload File</label><input type="file" name="entrance_files[]" class="form-control" accept=".pdf,.jpg,.jpeg,.png" onchange="previewFile(this)"></div>
-        <div class="col-md-3"><label class="form-label small fw-semibold">or Capture</label><button type="button" class="btn btn-capture btn-sm w-100" onclick="openCamera(${rowCount})"><i class="fas fa-camera me-1"></i>Capture</button></div>
-        <div class="col-md-2"><div class="preview-thumb" id="preview${rowCount}" style="display:none"><img src="" class="preview-thumb" id="previewImg${rowCount}"></div><input type="hidden" name="camera_data[]" id="cameraData${rowCount}"><input type="hidden" name="camera_labels[]" id="cameraLabel${rowCount}"><button type="button" class="btn btn-outline-danger btn-xs mt-1 remove-upload-row"><i class="fas fa-trash"></i></button></div>
-    `;
-    c.appendChild(r);
-    r.querySelector('.remove-upload-row').addEventListener('click',function(){this.closest('.upload-row').remove()});
-    rowCount++;
+// Toggle upload rows when checkboxes change
+document.querySelectorAll('input[name="entrance_data[]"]').forEach(cb => {
+    cb.addEventListener('change', function() {
+        const rowId = 'uploadRow_' + this.id;
+        const row = document.getElementById(rowId);
+        if (row) {
+            if (this.checked) {
+                row.classList.add('visible');
+            } else {
+                row.classList.remove('visible');
+                // Clear any file input or preview
+                const fileInput = row.querySelector('input[type="file"]');
+                if (fileInput) fileInput.value = '';
+                const preview = row.querySelector('.preview-thumb');
+                if (preview) preview.style.display = 'none';
+                // Also clear camera data
+                const camData = row.querySelector('input[name="camera_data[]"]');
+                if (camData) camData.value = '';
+            }
+        }
+    });
 });
 
 // Camera
-let currentRow=0,stream=null;
-async function openCamera(row){currentRow=row;const modal=document.getElementById('cameraModal'),video=document.getElementById('cameraVideo');modal.style.display='flex';try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});video.srcObject=stream}catch(e){alert('Cannot access camera. Please check permissions.');closeCamera()}}
-function closeCamera(){const modal=document.getElementById('cameraModal');modal.style.display='none';if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}}
-function capturePhoto(){const video=document.getElementById('cameraVideo'),canvas=document.getElementById('cameraCanvas');canvas.width=video.videoWidth;canvas.height=video.videoHeight;canvas.getContext('2d').drawImage(video,0,0);const dataUrl=canvas.toDataURL('image/jpeg',0.9);document.getElementById('cameraData'+currentRow).value=dataUrl;const labelInput=document.querySelector(`.upload-row[data-row="${currentRow}"] input[name="entrance_file_labels[]"]`);if(labelInput)document.getElementById('cameraLabel'+currentRow).value=labelInput.value||'Captured Document';const preview=document.getElementById('preview'+currentRow),previewImg=document.getElementById('previewImg'+currentRow);if(preview&&previewImg){previewImg.src=dataUrl;preview.style.display='block'}closeCamera()}
-function previewFile(input){const row=input.closest('.upload-row'),rid=row.getAttribute('data-row'),file=input.files[0];if(file&&file.type.startsWith('image/')){const reader=new FileReader();reader.onload=function(e){const preview=document.getElementById('preview'+rid),previewImg=document.getElementById('previewImg'+rid);if(preview&&previewImg){previewImg.src=e.target.result;preview.style.display='block'}};reader.readAsDataURL(file)}}
+let currentRow=null, stream=null;
+async function openCamera(rowId){
+    currentRow = rowId;
+    const modal = document.getElementById('cameraModal');
+    const video = document.getElementById('cameraVideo');
+    modal.style.display = 'flex';
+    try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+        video.srcObject = stream;
+    } catch(e) {
+        alert('Cannot access camera. Please check permissions.');
+        closeCamera();
+    }
+}
+function closeCamera(){
+    const modal = document.getElementById('cameraModal');
+    modal.style.display = 'none';
+    if(stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+}
+function capturePhoto(){
+    const video = document.getElementById('cameraVideo');
+    const canvas = document.getElementById('cameraCanvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+    // Find the corresponding hidden input for camera data
+    const dataInput = document.getElementById('cameraData_' + currentRow);
+    if (dataInput) {
+        dataInput.value = dataUrl;
+        // Also set the label if not already set
+        const labelInput = document.getElementById('cameraLabel_' + currentRow);
+        if (labelInput && !labelInput.value) {
+            // try to get label from the row's label input
+            const row = document.querySelector('#uploadRow_' + currentRow);
+            if (row) {
+                const labelField = row.querySelector('input[name="entrance_file_labels[]"]');
+                if (labelField) labelInput.value = labelField.value || 'Captured Document';
+            }
+        }
+        // Show preview
+        const preview = document.getElementById('preview_' + currentRow);
+        if (preview) {
+            const img = preview.querySelector('img');
+            if (img) {
+                img.src = dataUrl;
+                preview.style.display = 'block';
+            }
+        }
+        // Also clear any file input in the same row (user chose camera instead)
+        const row = document.querySelector('#uploadRow_' + currentRow);
+        if (row) {
+            const fileInput = row.querySelector('input[type="file"]');
+            if (fileInput) fileInput.value = '';
+        }
+    }
+    closeCamera();
+}
 
+// Additional: handle edit mode - when editing, show upload rows for checked checkboxes
+document.addEventListener('DOMContentLoaded', function() {
+    // Initially show rows for checked checkboxes
+    document.querySelectorAll('input[name="entrance_data[]"]:checked').forEach(cb => {
+        const rowId = 'uploadRow_' + cb.id;
+        const row = document.getElementById(rowId);
+        if (row) row.classList.add('visible');
+    });
+});
+
+// Form validation
 const form=document.getElementById('enrollForm');
 if(form){form.addEventListener('submit',function(e){let v=true;form.querySelectorAll('[required]').forEach(f=>{if(!f.checkValidity())v=false});if(form.querySelectorAll('input[name="entrance_data[]"]:checked').length===0){Swal.fire({icon:'error',title:'Required',text:<?= json_encode($t[$lang]['select_one_entrance']) ?>,confirmButtonColor:'#1e88e5'});v=false}const lrn=document.getElementById('lrn');if(lrn&&lrn.value&&!/^\d{12}$/.test(lrn.value)){Swal.fire({icon:'error',title:'Invalid LRN',text:'LRN must be exactly 12 digits',confirmButtonColor:'#1e88e5'});v=false}const i4=document.getElementById('is_4ps');if(i4&&(!i4.value||i4.value==='')){Swal.fire({icon:'error',title:'Required',text:'Please select YES or NO for CCT/4Ps recipient',confirmButtonColor:'#1e88e5'});v=false}if(!v)e.preventDefault()})}
 document.addEventListener('DOMContentLoaded',function(){<?php if(isset($_SESSION['success'])&&$_SESSION['success']===true): ?>Swal.fire({title:'Success!',html:<?= json_encode($_SESSION['success_message']??'Student successfully enrolled!') ?>,icon:'success',confirmButtonColor:'#1e88e5',confirmButtonText:'OK',timer:5000,timerProgressBar:true,allowOutsideClick:false}).then(()=>{window.location.href='enroll_form.php'});<?php unset($_SESSION['success']);unset($_SESSION['success_message']); ?><?php elseif(isset($_SESSION['error'])): ?>Swal.fire({title:'Error!',text:<?= json_encode($_SESSION['error']) ?>,icon:'error',confirmButtonColor:'#dc3545',confirmButtonText:'OK'});<?php unset($_SESSION['error']); ?><?php endif; ?>});
