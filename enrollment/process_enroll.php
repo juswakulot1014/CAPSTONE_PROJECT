@@ -7,6 +7,7 @@ if (session_status() === PHP_SESSION_NONE) {
 
 // Include database only once
 include_once __DIR__ . "/../config/db.php";
+require_once __DIR__ . "/../config/paths.php";
 
 // Check if request method is POST
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -38,6 +39,9 @@ function bind_params(mysqli_stmt $stmt, array $values): void
     }
     $stmt->bind_param($types, ...$values);
 }
+
+// Track files written to disk in case we need to clean up on rollback
+$written_files = [];
 
 // Begin transaction
 $conn->begin_transaction();
@@ -350,20 +354,24 @@ try {
     }
 
     // ============================================
-    // 8. INSERT uploaded/captured files from session (as BLOB)
+    // 8. SAVE UPLOADED FILES TO PRIVATE STORAGE (disk, not BLOB)
     // ============================================
     if (!empty($_SESSION['uploaded_files']) && is_array($_SESSION['uploaded_files'])) {
-        // Determine uploaded_by if user is logged in
+
+        // Safety limit: don't allow more than 10 files per enrollment
+        if (count($_SESSION['uploaded_files']) > 10) {
+            throw new Exception("Too many files uploaded (max 10).");
+        }
+
         $uploaded_by = $_SESSION['user_id'] ?? null;
 
-        // Prepare statement based on whether uploaded_by is available
         if ($uploaded_by !== null) {
             $file_stmt = $conn->prepare("INSERT INTO entrance_documents 
-                (student_id, document_name, submitted, uploaded_at, file_data, file_mime, file_name, uploaded_by) 
+                (student_id, document_name, submitted, uploaded_at, file_path, file_mime, file_name, uploaded_by) 
                 VALUES (?, ?, 1, NOW(), ?, ?, ?, ?)");
         } else {
             $file_stmt = $conn->prepare("INSERT INTO entrance_documents 
-                (student_id, document_name, submitted, uploaded_at, file_data, file_mime, file_name) 
+                (student_id, document_name, submitted, uploaded_at, file_path, file_mime, file_name) 
                 VALUES (?, ?, 1, NOW(), ?, ?, ?)");
         }
 
@@ -371,35 +379,95 @@ try {
             throw new Exception("Prepare failed for file insert: " . $conn->error);
         }
 
-        foreach ($_SESSION['uploaded_files'] as $file) {
-            $label = $file['label'] ?? 'Document';
-            $data = $file['data'] ?? '';
-            $mime = $file['mime'] ?? 'application/octet-stream';
-            $name = $file['name'] ?? $label;
+        // Allowed MIME types (real content, not client-declared)
+        $allowed_mime = [
+            'application/pdf'  => 'pdf',
+            'image/jpeg'       => 'jpg',
+            'image/png'        => 'png',
+        ];
 
-            // Decode base64 data to binary
+        $max_file_bytes = 5 * 1024 * 1024; // 5 MB
+
+        if (!is_dir(DOCUMENTS_DIR)) {
+            mkdir(DOCUMENTS_DIR, 0755, true);
+        }
+
+        foreach ($_SESSION['uploaded_files'] as $file) {
+            $label       = $file['label'] ?? 'Document';
+            $data        = $file['data']  ?? '';
+            $declared_mime = $file['mime'] ?? '';
+            $name        = $file['name']  ?? $label;
+
+            // Decode base64
             $binary_data = base64_decode($data, true);
-            if ($binary_data === false) {
-                continue; // Skip invalid data
+            if ($binary_data === false || $binary_data === '') {
+                continue; // skip invalid
             }
 
-            // Bind inside loop (mysqli requires re-bind before each execute)
+            // Size cap
+            if (strlen($binary_data) > $max_file_bytes) {
+                throw new Exception("File too large: " . $label . " (max 5 MB).");
+            }
+
+            // Write to temp, then verify MIME from content
+            $tmp = tempnam(sys_get_temp_dir(), 'enroll_');
+            if ($tmp === false) {
+                throw new Exception("Cannot create temp file.");
+            }
+            if (file_put_contents($tmp, $binary_data) === false) {
+                @unlink($tmp);
+                throw new Exception("Failed to stage file: " . $label);
+            }
+
+            $fi = finfo_open(FILEINFO_MIME_TYPE);
+            $real_mime = finfo_file($fi, $tmp);
+            finfo_close($fi);
+
+            if (!isset($allowed_mime[$real_mime])) {
+                @unlink($tmp);
+                throw new Exception("Invalid file type for '{$label}': {$real_mime}. Only PDF, JPG, PNG allowed.");
+            }
+
+            // Random, unguessable filename
+            $ext = $allowed_mime[$real_mime];
+            try {
+                $token = bin2hex(random_bytes(16));
+            } catch (Exception $e) {
+                $token = bin2hex(openssl_random_pseudo_bytes(16));
+            }
+            $filename = "enroll_{$student_info_id}_{$token}.{$ext}";
+            $abs_path = DOCUMENTS_DIR . $filename;
+
+            if (!rename($tmp, $abs_path)) {
+                @unlink($tmp);
+                throw new Exception("Failed to save file: " . $label);
+            }
+
+            // Track for rollback cleanup
+            $written_files[] = $abs_path;
+
+            // Sanitize original filename for storage
+            $safe_name = preg_replace('/[^A-Za-z0-9._\- ]/', '_', $name);
+            if ($safe_name === '' || $safe_name === null) {
+                $safe_name = $filename;
+            }
+
             if ($uploaded_by !== null) {
                 bind_params($file_stmt, [
                     $student_info_id,
                     $label,
-                    $binary_data,
-                    $mime,
-                    $name,
+                    $filename,
+                    $real_mime,
+                    $safe_name,
                     (int)$uploaded_by,
                 ]);
             } else {
                 bind_params($file_stmt, [
                     $student_info_id,
                     $label,
-                    $binary_data,
-                    $mime,
-                    $name,
+                    $filename,
+                    $real_mime,
+                    $safe_name,
                 ]);
             }
 
@@ -434,6 +502,13 @@ try {
 
 } catch (Exception $e) {
     $conn->rollback();
+
+    // Clean up any files written to disk during this failed enrollment
+    foreach ($written_files as $abs) {
+        if (file_exists($abs)) {
+            @unlink($abs);
+        }
+    }
 
     error_log("Enrollment Error: " . $e->getMessage());
     error_log("Error Trace: " . $e->getTraceAsString());
