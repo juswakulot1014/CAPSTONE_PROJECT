@@ -7,15 +7,22 @@ if (!isset($_SESSION['admin_id'])) {
     exit();
 }
 
+// ==================== REQUIRED DOCUMENTS CONFIG ====================
+$REQUIRED_DOCS = [
+    'Good Moral Certificate',
+    'Junior High School Certificate (Original)',
+    'NSO/PSA Birth Certificate (Original)',
+    '2 pcs. 2×2 picture',
+];
+
 // Check if exporting to Word
 $export_word = isset($_GET['export_word']) && $_GET['export_word'] == 1 && isset($_GET['id']);
 
 if ($export_word) {
     $student_id = (int)$_GET['id'];
-    
-    // OPTIMIZED: Single query for Word export
+
     $stmt = $conn->prepare("
-        SELECT s.*, 
+        SELECT s.*,
                p.father_name, p.father_occupation, p.father_contact,
                p.mother_maiden_name, p.mother_occupation, p.mother_contact,
                p.guardian_fullname, p.guardian_relation, p.guardian_contact,
@@ -30,21 +37,20 @@ if ($export_word) {
         WHERE s.student_id = ?
         ORDER BY e.enrollment_id DESC LIMIT 1
     ");
-    $stmt->bind_param("i", $student_id); $stmt->execute(); 
+    $stmt->bind_param("i", $student_id); $stmt->execute();
     $student = $stmt->get_result()->fetch_assoc(); $stmt->close();
     if (!$student) die("Student not found.");
-    
-    // Extract data from single result
+
     $enrollment = !empty($student['school_year']) ? $student : [];
     $parents = $student;
     $address = $student;
-    
+
     $edu_stmt = $conn->prepare("SELECT level, school_name, school_address, year_completed FROM educational_history WHERE student_id = ? ORDER BY level");
     $edu_stmt->bind_param("i", $student_id); $edu_stmt->execute(); $education = $edu_stmt->get_result()->fetch_all(MYSQLI_ASSOC); $edu_stmt->close();
-    
+
     $doc_stmt = $conn->prepare("SELECT document_name, submitted, file_path FROM entrance_documents WHERE student_id = ?");
     $doc_stmt->bind_param("i", $student_id); $doc_stmt->execute(); $documents = $doc_stmt->get_result()->fetch_all(MYSQLI_ASSOC); $doc_stmt->close();
-    
+
     $grades_stmt = $conn->prepare("SELECT sg.semester, sg.quarter, sg.subject_code, sg.subject_name, sg.grade, sg.remarks, e2.school_year, e2.grade_level FROM student_grades sg LEFT JOIN enrollment_form e2 ON sg.enrollment_id = e2.enrollment_id WHERE sg.student_id = ? ORDER BY e2.school_year DESC, e2.grade_level ASC, sg.semester ASC, sg.quarter ASC");
     $grades_stmt->bind_param("i", $student_id); $grades_stmt->execute(); $grades = $grades_stmt->get_result()->fetch_all(MYSQLI_ASSOC); $grades_stmt->close();
 
@@ -62,25 +68,58 @@ if ($export_word) {
     exit;
 }
 
-// ====================== HANDLERS (unchanged) ======================
+// ====================== HANDLERS ======================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_document'])) {
     $eid=(int)$_POST['entrance_id']; $sid=(int)$_POST['student_id'];
     if(isset($_FILES['document_file'])&&$_FILES['document_file']['error']===0){
         $ext=strtolower(pathinfo($_FILES['document_file']['name'],PATHINFO_EXTENSION));
-        if(in_array($ext,['pdf','jpg','jpeg','png','doc','docx'])){
-            $dir=__DIR__."/../uploads/documents/"; if(!is_dir($dir))mkdir($dir,0755,true);
-            $fn="doc_{$sid}_{$eid}_".time().".$ext"; $tp=$dir.$fn; $dp="uploads/documents/".$fn;
-            if(move_uploaded_file($_FILES['document_file']['tmp_name'],$tp)){$s=$conn->prepare("UPDATE entrance_documents SET submitted=1,file_path=?,uploaded_by=?,uploaded_at=NOW() WHERE entrance_id=? AND student_id=?"); $s->bind_param("siii",$dp,$_SESSION['admin_id'],$eid,$sid); $s->execute()?$_SESSION['success']="Uploaded!":$_SESSION['error']="DB error."; $s->close();}else $_SESSION['error']="File save failed.";
-        }else $_SESSION['error']="Invalid file type.";
-    }else $_SESSION['error']="No file.";
+        $allowed_ext=['pdf','jpg','jpeg','png','doc','docx'];
+        $allowed_mime=[
+            'application/pdf',
+            'image/jpeg',
+            'image/png',
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        ];
+        $max_bytes = 5 * 1024 * 1024;
+
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mime  = finfo_file($finfo, $_FILES['document_file']['tmp_name']);
+        finfo_close($finfo);
+
+        if(!in_array($ext, $allowed_ext, true)){
+            $_SESSION['error']="Invalid file type.";
+        } elseif(!in_array($mime, $allowed_mime, true)){
+            $_SESSION['error']="Invalid file content (MIME mismatch).";
+        } elseif($_FILES['document_file']['size'] > $max_bytes){
+            $_SESSION['error']="File too large (max 5 MB).";
+        } else {
+            $dir=__DIR__."/../uploads/documents/";
+            if(!is_dir($dir)) mkdir($dir,0755,true);
+            $fn="doc_{$sid}_{$eid}_".time().".".$ext;
+            $tp=$dir.$fn;
+            $dp="uploads/documents/".$fn;
+            if(move_uploaded_file($_FILES['document_file']['tmp_name'],$tp)){
+                $orig_name = $_FILES['document_file']['name'];
+                $s=$conn->prepare("UPDATE entrance_documents SET submitted=1,file_path=?,file_name=?,file_mime=?,file_data=NULL,uploaded_by=?,uploaded_at=NOW() WHERE entrance_id=? AND student_id=?");
+                $s->bind_param("sssiii",$dp,$orig_name,$mime,$_SESSION['admin_id'],$eid,$sid);
+                $s->execute() ? $_SESSION['success']="Document uploaded!" : $_SESSION['error']="DB error.";
+                $s->close();
+            } else {
+                $_SESSION['error']="File save failed.";
+            }
+        }
+    } else {
+        $_SESSION['error']="No file selected.";
+    }
     header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_document'])) {
     $eid=(int)$_POST['entrance_id']; $sid=(int)$_POST['student_id'];
     $s=$conn->prepare("SELECT file_path FROM entrance_documents WHERE entrance_id=? AND student_id=?"); $s->bind_param("ii",$eid,$sid); $s->execute(); $r=$s->get_result()->fetch_assoc(); $s->close();
     if($r&&!empty($r['file_path'])){$p=__DIR__."/../".$r['file_path']; if(file_exists($p))unlink($p);}
-    $s=$conn->prepare("UPDATE entrance_documents SET submitted=0,file_path=NULL,uploaded_by=NULL,uploaded_at=NULL WHERE entrance_id=? AND student_id=?"); $s->bind_param("ii",$eid,$sid); $s->execute(); $s->close();
-    $_SESSION['success']="Deleted!"; header("Location: view_student.php?id=$sid"); exit();
+    $s=$conn->prepare("UPDATE entrance_documents SET submitted=0,file_path=NULL,file_name=NULL,file_mime=NULL,file_data=NULL,uploaded_by=NULL,uploaded_at=NULL WHERE entrance_id=? AND student_id=?"); $s->bind_param("ii",$eid,$sid); $s->execute(); $s->close();
+    $_SESSION['success']="Document removed!"; header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_photo'])) {
     $sid=(int)$_POST['student_id'];
@@ -90,60 +129,59 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_photo'])) {
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_student'])) {
     $sid=(int)$_POST['student_id']; $conn->begin_transaction();
     try{foreach(['student_grades','entrance_documents','educational_history','addresses','parents_info','enrollment_form'] as $t){$s=$conn->prepare("DELETE FROM `$t` WHERE student_id=?"); $s->bind_param("i",$sid); $s->execute(); $s->close();}$s=$conn->prepare("DELETE FROM students_info WHERE student_id=?"); $s->bind_param("i",$sid); $s->execute(); $s->close();$conn->commit();$_SESSION['success']="Student deleted!"; header("Location: student_profile.php"); exit();}
-    catch(Exception $e){$conn->rollback();$_SESSION['error']="Failed."; header("Location: view_student.php?id=$sid"); exit();}
+    catch(Exception $e){$conn->rollback();$_SESSION['error']="Failed to delete."; header("Location: view_student.php?id=$sid"); exit();}
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_grade'])) {
     $sid=(int)$_POST['student_id']; $sem=trim($_POST['semester']??''); $qtr=trim($_POST['quarter']??''); $sc=trim($_POST['subject_code']??''); $sn=trim($_POST['subject_name']??''); $gr=!empty($_POST['grade'])?(float)$_POST['grade']:null; $rem=trim($_POST['remarks']??'');
     $es=$conn->prepare("SELECT enrollment_id FROM enrollment_form WHERE student_id=? ORDER BY enrollment_id DESC LIMIT 1"); $es->bind_param("i",$sid); $es->execute(); $er=$es->get_result()->fetch_assoc(); $es->close();
-    if(!$er){$_SESSION['error']="No enrollment."; header("Location: view_student.php?id=$sid"); exit();}
+    if(!$er){$_SESSION['error']="No enrollment record."; header("Location: view_student.php?id=$sid"); exit();}
     if(empty($sem)||empty($sc)||empty($sn)){$_SESSION['error']="Fill required fields.";}
-    else{$s=$conn->prepare("INSERT INTO student_grades (student_id,enrollment_id,semester,quarter,subject_code,subject_name,grade,remarks) VALUES (?,?,?,?,?,?,?,?)"); $s->bind_param("iissssds",$sid,$er['enrollment_id'],$sem,$qtr,$sc,$sn,$gr,$rem); $s->execute()?$_SESSION['success']="Added!":$_SESSION['error']="Failed."; $s->close();}
+    else{$s=$conn->prepare("INSERT INTO student_grades (student_id,enrollment_id,semester,quarter,subject_code,subject_name,grade,remarks) VALUES (?,?,?,?,?,?,?,?)"); $s->bind_param("iissssds",$sid,$er['enrollment_id'],$sem,$qtr,$sc,$sn,$gr,$rem); $s->execute()?$_SESSION['success']="Grade added!":$_SESSION['error']="Failed to add grade."; $s->close();}
     header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_grade'])) {
     $gid=(int)$_POST['grade_id']; $sid=(int)$_POST['student_id']; $sem=trim($_POST['semester']??''); $qtr=trim($_POST['quarter']??''); $sc=trim($_POST['subject_code']??''); $sn=trim($_POST['subject_name']??''); $gr=!empty($_POST['grade'])?(float)$_POST['grade']:null; $rem=trim($_POST['remarks']??'');
     $es=$conn->prepare("SELECT enrollment_id FROM enrollment_form WHERE student_id=? ORDER BY enrollment_id DESC LIMIT 1"); $es->bind_param("i",$sid); $es->execute(); $er=$es->get_result()->fetch_assoc(); $es->close();
-    $s=$conn->prepare("UPDATE student_grades SET semester=?,quarter=?,subject_code=?,subject_name=?,grade=?,remarks=?,enrollment_id=? WHERE grade_id=? AND student_id=?"); $s->bind_param("ssssdsiii",$sem,$qtr,$sc,$sn,$gr,$rem,$er['enrollment_id'],$gid,$sid); $s->execute()?$_SESSION['success']="Updated!":$_SESSION['error']="Failed."; $s->close();
+    $s=$conn->prepare("UPDATE student_grades SET semester=?,quarter=?,subject_code=?,subject_name=?,grade=?,remarks=?,enrollment_id=? WHERE grade_id=? AND student_id=?"); $s->bind_param("ssssdsiii",$sem,$qtr,$sc,$sn,$gr,$rem,$er['enrollment_id'],$gid,$sid); $s->execute()?$_SESSION['success']="Grade updated!":$_SESSION['error']="Failed to update."; $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_grade'])) {
     $gid=(int)$_POST['grade_id']; $sid=(int)$_POST['student_id'];
-    $s=$conn->prepare("DELETE FROM student_grades WHERE grade_id=? AND student_id=?"); $s->bind_param("ii",$gid,$sid); $s->execute()?$_SESSION['success']="Deleted!":$_SESSION['error']="Failed."; $s->close();
+    $s=$conn->prepare("DELETE FROM student_grades WHERE grade_id=? AND student_id=?"); $s->bind_param("ii",$gid,$sid); $s->execute()?$_SESSION['success']="Grade deleted!":$_SESSION['error']="Failed to delete."; $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_education'])) {
     $sid=(int)$_POST['student_id']; $lvl=trim($_POST['level']??''); $schn=trim($_POST['school_name']??''); $scha=trim($_POST['school_address']??''); $yr=trim($_POST['year_completed']??'');
-    if(empty($lvl)||empty($schn)){$_SESSION['error']="Required fields.";}else{$s=$conn->prepare("INSERT INTO educational_history (student_id,level,school_name,school_address,year_completed) VALUES (?,?,?,?,?)"); $s->bind_param("issss",$sid,$lvl,$schn,$scha,$yr); $s->execute()?$_SESSION['success']="Added!":$_SESSION['error']="Failed."; $s->close();}
+    if(empty($lvl)||empty($schn)){$_SESSION['error']="Required fields missing.";}else{$s=$conn->prepare("INSERT INTO educational_history (student_id,level,school_name,school_address,year_completed) VALUES (?,?,?,?,?)"); $s->bind_param("issss",$sid,$lvl,$schn,$scha,$yr); $s->execute()?$_SESSION['success']="Education added!":$_SESSION['error']="Failed to add."; $s->close();}
     header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_education'])) {
     $eid=(int)$_POST['edu_id']; $sid=(int)$_POST['student_id']; $lvl=trim($_POST['level']??''); $schn=trim($_POST['school_name']??''); $scha=trim($_POST['school_address']??''); $yr=trim($_POST['year_completed']??'');
-    $s=$conn->prepare("UPDATE educational_history SET level=?,school_name=?,school_address=?,year_completed=? WHERE edu_id=? AND student_id=?"); $s->bind_param("ssssii",$lvl,$schn,$scha,$yr,$eid,$sid); $s->execute()?$_SESSION['success']="Updated!":$_SESSION['error']="Failed."; $s->close();
+    $s=$conn->prepare("UPDATE educational_history SET level=?,school_name=?,school_address=?,year_completed=? WHERE edu_id=? AND student_id=?"); $s->bind_param("ssssii",$lvl,$schn,$scha,$yr,$eid,$sid); $s->execute()?$_SESSION['success']="Education updated!":$_SESSION['error']="Failed to update."; $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_education'])) {
     $eid=(int)$_POST['edu_id']; $sid=(int)$_POST['student_id'];
-    $s=$conn->prepare("DELETE FROM educational_history WHERE edu_id=? AND student_id=?"); $s->bind_param("ii",$eid,$sid); $s->execute()?$_SESSION['success']="Deleted!":$_SESSION['error']="Failed."; $s->close();
+    $s=$conn->prepare("DELETE FROM educational_history WHERE edu_id=? AND student_id=?"); $s->bind_param("ii",$eid,$sid); $s->execute()?$_SESSION['success']="Education deleted!":$_SESSION['error']="Failed to delete."; $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
 
-// ====================== FETCH DATA (OPTIMIZED - SINGLE QUERY) ======================
-if(!isset($_GET['id'])||!is_numeric($_GET['id'])){$_SESSION['error']="No ID."; header("Location: student_profile.php"); exit();}
+// ====================== FETCH DATA ======================
+if(!isset($_GET['id'])||!is_numeric($_GET['id'])){$_SESSION['error']="No student ID."; header("Location: student_profile.php"); exit();}
 $student_id=(int)$_GET['id'];
 
-// SINGLE OPTIMIZED QUERY - replaces 4 separate queries
 $s = $conn->prepare("
-    SELECT s.*, 
+    SELECT s.*,
            p.father_name, p.father_occupation, p.father_contact,
            p.mother_name, p.mother_maiden_name, p.mother_occupation, p.mother_contact,
            p.guardian_fullname, p.guardian_relation, p.guardian_contact,
            p.ave_family_income, p.is_4ps, p.household_id as parent_household_id,
-           a.purok_street, a.barangay, a.town_city, a.province, 
+           a.purok_street, a.barangay, a.town_city, a.province,
            a.region, a.district, a.postal_code,
-           e.enrollment_id, e.grade_level, e.track, e.strand, e.program, 
-           e.section, e.school_year, e.semester, e.status, e.voucher_status, 
-           e.household_id, e.is_transferred, e.previous_school_name, 
-           e.previous_school_address, e.previous_track, e.previous_strand, 
+           e.enrollment_id, e.grade_level, e.track, e.strand, e.program,
+           e.section, e.school_year, e.semester, e.status, e.voucher_status,
+           e.household_id, e.is_transferred, e.previous_school_name,
+           e.previous_school_address, e.previous_track, e.previous_strand,
            e.previous_program, e.previous_year_completed, e.cct_4ps
     FROM students_info s
     LEFT JOIN parents_info p ON s.student_id = p.student_id
@@ -157,34 +195,75 @@ $s->execute();
 $student = $s->get_result()->fetch_assoc();
 $s->close();
 
-if (!$student) { $_SESSION['error'] = "Not found."; header("Location: student_profile.php"); exit(); }
+if (!$student) { $_SESSION['error'] = "Student not found."; header("Location: student_profile.php"); exit(); }
 
-// All data is now in $student array
 $enrollment = !empty($student['enrollment_id']) ? $student : [];
 $parents = $student;
 $address = $student;
 
-// Education and documents still separate (less frequent, simpler queries)
-$s=$conn->prepare("SELECT edu_id,level,school_name,school_address,year_completed FROM educational_history WHERE student_id=? ORDER BY CASE level WHEN 'Elementary' THEN 1 WHEN 'JHS' THEN 2 ELSE 3 END"); 
+// Auto-seed required documents
+$check = $conn->prepare("SELECT COUNT(*) c FROM entrance_documents WHERE student_id = ? AND document_name = ?");
+$insert = $conn->prepare("INSERT INTO entrance_documents (student_id, document_name, submitted) VALUES (?, ?, 0)");
+foreach ($REQUIRED_DOCS as $docName) {
+    $check->bind_param("is", $student_id, $docName);
+    $check->execute();
+    if ((int)$check->get_result()->fetch_assoc()['c'] === 0) {
+        $insert->bind_param("is", $student_id, $docName);
+        $insert->execute();
+    }
+}
+$check->close();
+$insert->close();
+
+// Education
+$s=$conn->prepare("SELECT edu_id,level,school_name,school_address,year_completed FROM educational_history WHERE student_id=? ORDER BY CASE level WHEN 'Elementary' THEN 1 WHEN 'JHS' THEN 2 ELSE 3 END");
 $s->bind_param("i",$student_id); $s->execute(); $education=$s->get_result()->fetch_all(MYSQLI_ASSOC); $s->close();
 
-$s=$conn->prepare("SELECT entrance_id,document_name,submitted,file_path FROM entrance_documents WHERE student_id=? ORDER BY document_name"); 
-$s->bind_param("i",$student_id); $s->execute(); $documents=$s->get_result()->fetch_all(MYSQLI_ASSOC); $s->close();
+// Documents
+$s=$conn->prepare("
+    SELECT d.entrance_id, d.document_name, d.submitted, d.file_path,
+           d.uploaded_at, d.file_name, d.file_mime,
+           CASE WHEN d.file_data IS NOT NULL THEN 1 ELSE 0 END AS has_blob,
+           LENGTH(d.file_data) AS blob_size,
+           a.fullname AS uploader_name
+    FROM entrance_documents d
+    LEFT JOIN admins a ON d.uploaded_by = a.id
+    WHERE d.student_id = ?
+    ORDER BY FIELD(d.document_name,
+        'Good Moral Certificate',
+        'Junior High School Certificate (Original)',
+        'NSO/PSA Birth Certificate (Original)',
+        '2 pcs. 2×2 picture'),
+        d.document_name
+");
+$s->bind_param("i",$student_id);
+$s->execute();
+$documents=$s->get_result()->fetch_all(MYSQLI_ASSOC);
+$s->close();
 
-// Fetch grades with enrollment details for full academic record
+// Document counters
+$docs_total = count($documents);
+$docs_ok = 0;
+foreach ($documents as $d) {
+    if (empty($d['submitted'])) continue;
+    $hasBlob = !empty($d['has_blob']);
+    $hasPath = !empty($d['file_path']) && file_exists(__DIR__ . "/../" . $d['file_path']);
+    if ($hasBlob || $hasPath) $docs_ok++;
+}
+
+// Grades
 $grades_stmt = $conn->prepare("
     SELECT sg.grade_id, sg.semester, sg.quarter, sg.subject_code, sg.subject_name, sg.grade, sg.remarks,
            e2.school_year, e2.grade_level
     FROM student_grades sg
     LEFT JOIN enrollment_form e2 ON sg.enrollment_id = e2.enrollment_id
-    WHERE sg.student_id = ? 
+    WHERE sg.student_id = ?
     ORDER BY e2.school_year DESC, e2.grade_level ASC, sg.semester ASC, sg.quarter ASC, sg.subject_name ASC
 ");
 $grades_stmt->bind_param("i", $student_id);
 $grades_stmt->execute();
 $grades_result = $grades_stmt->get_result();
 
-// Organize by School Year → Grade Level → Semester → Quarter
 $academic_record = [];
 $all_grades_flat = [];
 while ($row = $grades_result->fetch_assoc()) {
@@ -208,6 +287,23 @@ foreach ($academic_record as $sy => $levels) {
     $yt = 0; $yc = 0;
     foreach ($levels as $gl => $semesters) { foreach ($semesters as $sem => $quarters) { foreach ($quarters as $qtr => $subjects) { foreach ($subjects as $subj) { if ($subj['grade'] !== null && is_numeric($subj['grade'])) { $yt += (float)$subj['grade']; $yc++; } } } } }
     $gwa_per_year[$sy] = $yc > 0 ? round($yt / $yc, 2) : null;
+}
+
+// Stat card values + auto-size class
+function statSizeClass($val) {
+    $len = mb_strlen((string)$val);
+    if ($len > 30) return 'xs';
+    if ($len > 14) return 'sm';
+    return '';
+}
+$stat_grade   = $enrollment['grade_level'] ?? '—';
+$stat_section = $enrollment['section']     ?? '—';
+$stat_strand  = $enrollment['strand']      ?? '—';
+$stat_program = $enrollment['program']     ?? '';
+$strand_fallback = false;
+if ($stat_strand !== '' && $stat_section === $stat_strand && $stat_program !== '') {
+    $stat_strand = $stat_program;
+    $strand_fallback = true;
 }
 
 $theme=isset($_COOKIE['admin_theme'])&&$_COOKIE['admin_theme']==='dark'?'dark':'light';
@@ -264,8 +360,11 @@ $fullName=htmlspecialchars(trim(($student['last_name']??'').', '.($student['firs
         .badge-pill.primary{background:#eef2ff;color:#4338ca}.badge-pill.success{background:#d1fae5;color:#065f46}.badge-pill.info{background:#dbeafe;color:#1e40af}
         [data-bs-theme="dark"] .badge-pill.primary{background:#312e81;color:#a5b4fc}[data-bs-theme="dark"] .badge-pill.success{background:#064e3b;color:#6ee7b7}[data-bs-theme="dark"] .badge-pill.info{background:#1e3a5f;color:#93c5fd}
         .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem}
-        .stat-card{background:var(--bg);border-radius:var(--radius);padding:1rem;text-align:center}
-        .stat-value{font-size:1.5rem;font-weight:700;color:var(--accent)}.stat-label{font-size:0.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-top:0.25rem}
+        .stat-card{background:var(--bg);border-radius:var(--radius);padding:1rem;text-align:center;display:flex;flex-direction:column;justify-content:center;min-height:96px}
+        .stat-value{font-size:1.5rem;font-weight:700;color:var(--accent);line-height:1.15;word-break:break-word}
+        .stat-value.sm{font-size:1.05rem}
+        .stat-value.xs{font-size:0.82rem;font-weight:600;line-height:1.25}
+        .stat-label{font-size:0.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-top:0.35rem}
         .info-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0;border-top:1px solid var(--border);border-left:1px solid var(--border)}
         .info-cell{padding:0.75rem 1rem;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
         .info-cell .label{font-size:0.68rem;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:0.2rem}
@@ -309,7 +408,14 @@ $fullName=htmlspecialchars(trim(($student['last_name']??'').', '.($student['firs
 
     <div class="topbar">
         <div class="d-flex align-items-center gap-3"><button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button><div><div class="breadcrumb-nav"><a href="student_profile.php">Students</a> <i class="bi bi-chevron-right small"></i> Profile</div><h2 style="font-size:1.3rem;font-weight:700;margin:0">Student Profile</h2></div></div>
-        <div class="d-flex gap-2"><a href="?id=<?= $student_id ?>&export_word=1" class="btn btn-outline-success btn-sm"><i class="bi bi-file-word me-1"></i> Export</a><button class="btn btn-outline-secondary btn-sm" onclick="window.print()"><i class="bi bi-printer me-1"></i> Print</button><button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button></div>
+        <div class="d-flex gap-2 flex-wrap">
+            <a href="sf10.php?id=<?= $student_id ?>" class="btn btn-outline-primary btn-sm" target="_blank">
+                <i class="bi bi-file-earmark-text me-1"></i> SF10
+            </a>
+            <a href="export_students.php?student_id=<?= $student_id ?>" class="btn btn-outline-success btn-sm"><i class="bi bi-download me-1"></i> Export</a>
+            <button class="btn btn-outline-secondary btn-sm" onclick="window.print()"><i class="bi bi-printer me-1"></i> Print</button>
+            <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+        </div>
     </div>
 
     <!-- Hero Card -->
@@ -319,7 +425,32 @@ $fullName=htmlspecialchars(trim(($student['last_name']??'').', '.($student['firs
     </div></div>
 
     <!-- Quick Stats -->
-    <div class="stat-grid"><div class="stat-card"><div class="stat-value"><?= htmlspecialchars($enrollment['grade_level']??'—') ?></div><div class="stat-label">Grade</div></div><div class="stat-card"><div class="stat-value"><?= htmlspecialchars($enrollment['section']??'—') ?></div><div class="stat-label">Section</div></div><div class="stat-card"><div class="stat-value"><?= htmlspecialchars($enrollment['strand']??'—') ?></div><div class="stat-label">Strand</div></div><div class="stat-card"><div class="stat-value"><?= htmlspecialchars($student['age']??'—') ?></div><div class="stat-label">Age</div></div><div class="stat-card"><div class="stat-value"><?= htmlspecialchars($student['sex']??'—') ?></div><div class="stat-label">Sex</div></div><div class="stat-card"><div class="stat-value"><?= $overall_gwa!==null?number_format($overall_gwa,2):'—' ?></div><div class="stat-label">GWA</div></div></div>
+    <div class="stat-grid">
+        <div class="stat-card">
+            <div class="stat-value <?= statSizeClass($stat_grade) ?>"><?= htmlspecialchars($stat_grade) ?></div>
+            <div class="stat-label">Grade</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value <?= statSizeClass($stat_section) ?>" title="<?= htmlspecialchars($stat_section) ?>"><?= htmlspecialchars($stat_section) ?></div>
+            <div class="stat-label">Section</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value <?= statSizeClass($stat_strand) ?>" title="<?= htmlspecialchars($stat_strand) ?>"><?= htmlspecialchars($stat_strand) ?></div>
+            <div class="stat-label"><?= $strand_fallback ? 'Program' : 'Strand' ?></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value"><?= htmlspecialchars($student['age'] ?? '—') ?></div>
+            <div class="stat-label">Age</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value"><?= htmlspecialchars($student['sex'] ?? '—') ?></div>
+            <div class="stat-label">Sex</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value"><?= $overall_gwa !== null ? number_format($overall_gwa, 2) : '—' ?></div>
+            <div class="stat-label">GWA</div>
+        </div>
+    </div>
 
     <!-- Personal Info + Enrollment/Address -->
     <div class="row g-3 mt-2">
@@ -334,7 +465,113 @@ $fullName=htmlspecialchars(trim(($student['last_name']??'').', '.($student['firs
     <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-people"></i> Parents & Guardian</h3></div><div class="card-body no-padding"><?php if(!empty($parents)): ?><div class="info-grid"><div class="info-cell"><div class="label">Father Name</div><div class="value"><?= htmlspecialchars($parents['father_name']??'—') ?></div></div><div class="info-cell"><div class="label">Father Occupation</div><div class="value"><?= htmlspecialchars($parents['father_occupation']??'—') ?></div></div><div class="info-cell"><div class="label">Father Contact</div><div class="value"><?= htmlspecialchars($parents['father_contact']??'—') ?></div></div><div class="info-cell"><div class="label">Mother (Maiden)</div><div class="value"><?= htmlspecialchars($parents['mother_maiden_name']??'—') ?></div></div><div class="info-cell"><div class="label">Mother Occupation</div><div class="value"><?= htmlspecialchars($parents['mother_occupation']??'—') ?></div></div><div class="info-cell"><div class="label">Mother Contact</div><div class="value"><?= htmlspecialchars($parents['mother_contact']??'—') ?></div></div><div class="info-cell"><div class="label">Family Income</div><div class="value fw-bold"><?= $parents['ave_family_income']?'₱'.number_format($parents['ave_family_income'],2):'—' ?></div></div><div class="info-cell"><div class="label">4Ps</div><div class="value"><span class="status-dot <?= !empty($parents['is_4ps'])?'success':'danger' ?>"><?= !empty($parents['is_4ps'])?'Yes':'No' ?></span></div></div><div class="info-cell"><div class="label">Household ID</div><div class="value"><?= htmlspecialchars($parents['parent_household_id']??$parents['household_id']??'—') ?></div></div><div class="info-cell span-2" style="background:var(--bg)"><div class="label">Guardian</div><div class="value"><?= htmlspecialchars($parents['guardian_fullname']??'—') ?> (<?= htmlspecialchars($parents['guardian_relation']??'—') ?>) — <?= htmlspecialchars($parents['guardian_contact']??'—') ?></div></div></div><?php else: ?><div class="p-4 text-center text-muted">No data.</div><?php endif; ?></div></div>
 
     <!-- Documents -->
-    <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-file-earmark-check"></i> Required Documents</h3></div><div class="card-body no-padding"><?php if(!empty($documents)): ?><table class="table-admin"><thead><tr><th>Document</th><th width="100">Status</th><th width="130" style="text-align:right">Action</th></tr></thead><tbody><?php foreach($documents as $d): $ok=!empty($d['submitted'])&&!empty($d['file_path']); ?><tr><td><i class="bi bi-file-earmark-text me-2 text-muted"></i> <?= htmlspecialchars($d['document_name']) ?></td><td><span class="status-dot <?= $ok?'success':'danger' ?>"><?= $ok?'Submitted':'Missing' ?></span></td><td style="text-align:right"><?php if($ok): ?><div class="btn-group-actions" style="justify-content:flex-end"><a href="../<?= htmlspecialchars($d['file_path']) ?>" class="btn btn-icon btn-outline-primary" target="_blank"><i class="bi bi-eye"></i></a><button class="btn btn-icon btn-outline-danger delete-doc-btn" data-eid="<?= $d['entrance_id'] ?>" data-name="<?= htmlspecialchars($d['document_name']) ?>"><i class="bi bi-trash3"></i></button></div><?php else: ?><button class="btn btn-primary btn-xs upload-doc-btn" data-eid="<?= $d['entrance_id'] ?>" data-name="<?= htmlspecialchars($d['document_name']) ?>"><i class="bi bi-upload me-1"></i> Upload</button><?php endif; ?></td></tr><?php endforeach; ?></tbody></table><?php else: ?><div class="p-4 text-center text-muted">No documents.</div><?php endif; ?></div></div>
+    <div class="card mt-3">
+        <div class="card-header">
+            <h3>
+                <i class="bi bi-file-earmark-check"></i> Required Documents
+                <?php if($docs_total > 0): ?>
+                    <span class="badge-pill <?= $docs_ok === $docs_total ? 'success' : 'primary' ?> ms-2">
+                        <?= $docs_ok ?> / <?= $docs_total ?> Submitted
+                    </span>
+                <?php endif; ?>
+            </h3>
+        </div>
+        <div class="card-body no-padding">
+            <?php if(!empty($documents)): ?>
+            <table class="table-admin">
+                <thead>
+                    <tr>
+                        <th>Document</th>
+                        <th width="110">Status</th>
+                        <th>File</th>
+                        <th width="170" style="text-align:right">Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach($documents as $d):
+                    $hasBlob  = !empty($d['has_blob']);
+                    $hasPath  = !empty($d['file_path']) && file_exists(__DIR__ . "/../" . $d['file_path']);
+                    $ok       = !empty($d['submitted']) && ($hasBlob || $hasPath);
+
+                    if ($hasPath) {
+                        $size = filesize(__DIR__ . "/../" . $d['file_path']);
+                    } elseif ($hasBlob) {
+                        $size = (int)$d['blob_size'];
+                    } else {
+                        $size = 0;
+                    }
+
+                    if (!empty($d['file_name'])) {
+                        $fname = $d['file_name'];
+                    } elseif ($hasPath) {
+                        $fname = basename($d['file_path']);
+                    } else {
+                        $fname = 'document';
+                    }
+
+                    $probe    = $hasPath ? $d['file_path'] : $fname;
+                    $isImage  = $ok && preg_match('/\.(jpe?g|png|gif|webp)$/i', $probe);
+                    $isPdf    = $ok && preg_match('/\.pdf$/i', $probe);
+                    $source   = $hasBlob ? 'stored in database' : ($hasPath ? 'stored on disk' : '');
+                ?>
+                    <tr>
+                        <td><i class="bi bi-file-earmark-text me-2 text-muted"></i> <?= htmlspecialchars($d['document_name']) ?></td>
+                        <td>
+                            <?php if($ok): ?>
+                                <span class="status-dot success">Submitted</span>
+                            <?php elseif(!empty($d['submitted']) && !$ok): ?>
+                                <span class="status-dot danger" title="Record exists but the file is missing">File lost</span>
+                            <?php else: ?>
+                                <span class="status-dot danger">Missing</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="small">
+                            <?php if($ok): ?>
+                                <div class="fw-semibold text-truncate" style="max-width:280px" title="<?= htmlspecialchars($fname) ?>">
+                                    <?php if($isImage): ?><i class="bi bi-file-earmark-image me-1"></i>
+                                    <?php elseif($isPdf): ?><i class="bi bi-file-earmark-pdf me-1"></i>
+                                    <?php else: ?><i class="bi bi-file-earmark me-1"></i><?php endif; ?>
+                                    <?= htmlspecialchars($fname) ?>
+                                </div>
+                                <div class="text-muted" style="font-size:0.72rem">
+                                    <?= number_format($size / 1024, 1) ?> KB
+                                    <?php if(!empty($d['uploaded_at'])): ?>
+                                        · <?= date('M d, Y g:i A', strtotime($d['uploaded_at'])) ?>
+                                    <?php endif; ?>
+                                    <?php if(!empty($d['uploader_name'])): ?>
+                                        · by <?= htmlspecialchars($d['uploader_name']) ?>
+                                    <?php endif; ?>
+                                    <?php if($source): ?>
+                                        · <?= $source ?>
+                                    <?php endif; ?>
+                                </div>
+                            <?php else: ?>
+                                <span class="text-muted">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="text-align:right">
+                            <?php if($ok): ?>
+                                <div class="btn-group-actions" style="justify-content:flex-end">
+                                    <a href="document.php?id=<?= $d['entrance_id'] ?>" class="btn btn-icon btn-outline-primary" target="_blank" title="View"><i class="bi bi-eye"></i></a>
+                                    <a href="document.php?id=<?= $d['entrance_id'] ?>&mode=download" class="btn btn-icon btn-outline-secondary" title="Download"><i class="bi bi-download"></i></a>
+                                    <button class="btn btn-icon btn-outline-danger delete-doc-btn" data-eid="<?= $d['entrance_id'] ?>" data-name="<?= htmlspecialchars($d['document_name']) ?>" title="Delete"><i class="bi bi-trash3"></i></button>
+                                </div>
+                            <?php else: ?>
+                                <button class="btn btn-primary btn-xs upload-doc-btn" data-eid="<?= $d['entrance_id'] ?>" data-name="<?= htmlspecialchars($d['document_name']) ?>"><i class="bi bi-upload me-1"></i> Upload</button>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+            <?php else: ?>
+                <div class="p-4 text-center text-muted">
+                    <i class="bi bi-file-earmark display-4 d-block mb-3"></i>
+                    No documents configured for this student.
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
 
     <!-- Education -->
     <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-book"></i> Educational History</h3><button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addEducationModal"><i class="bi bi-plus-lg me-1"></i> Add</button></div><div class="card-body no-padding"><?php if(!empty($education)): ?><table class="table-admin"><thead><tr><th>Level</th><th>School Name</th><th>Address</th><th width="80">Year</th><th width="100" style="text-align:right">Action</th></tr></thead><tbody><?php foreach($education as $e): ?><tr><td class="fw-semibold"><?= htmlspecialchars($e['level']) ?></td><td><?= htmlspecialchars($e['school_name']) ?></td><td><?= htmlspecialchars($e['school_address']??'—') ?></td><td><?= htmlspecialchars($e['year_completed']??'—') ?></td><td style="text-align:right"><div class="btn-group-actions" style="justify-content:flex-end"><button class="btn btn-icon btn-outline-warning edit-edu-btn" data-bs-toggle="modal" data-bs-target="#editEducationModal" data-id="<?= $e['edu_id'] ?>" data-lvl="<?= htmlspecialchars($e['level']) ?>" data-sch="<?= htmlspecialchars($e['school_name']) ?>" data-adr="<?= htmlspecialchars($e['school_address']??'') ?>" data-yr="<?= htmlspecialchars($e['year_completed']??'') ?>"><i class="bi bi-pencil"></i></button><button class="btn btn-icon btn-outline-danger del-edu-btn" data-id="<?= $e['edu_id'] ?>" data-sch="<?= htmlspecialchars($e['school_name']) ?>"><i class="bi bi-trash3"></i></button></div></td></tr><?php endforeach; ?></tbody></table><?php else: ?><div class="p-4 text-center text-muted">No records.</div><?php endif; ?></div></div>
@@ -355,9 +592,9 @@ $fullName=htmlspecialchars(trim(($student['last_name']??'').', '.($student['firs
 
 <div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
 
-<!-- MODALS (same as original) -->
+<!-- MODALS -->
 <div class="modal fade" id="uploadPhotoModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-camera me-2"></i>Change Photo</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" enctype="multipart/form-data"><div class="modal-body"><input type="hidden" name="upload_photo" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="file" name="student_photo" class="form-control" accept="image/*" required></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm">Upload</button></div></form></div></div></div>
-<div class="modal fade" id="uploadDocumentModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-cloud-upload me-2"></i>Upload Document</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="docForm" enctype="multipart/form-data"><input type="hidden" name="upload_document" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="hidden" name="entrance_id" id="m_eid"><p class="fw-semibold small mb-2" id="m_dname"></p><input type="file" name="document_file" id="m_file" class="form-control" required><div id="m_msg" class="mt-2"></div></form></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="btnUpDoc">Upload</button></div></div></div></div>
+<div class="modal fade" id="uploadDocumentModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-cloud-upload me-2"></i>Upload Document</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="docForm" enctype="multipart/form-data"><input type="hidden" name="upload_document" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="hidden" name="entrance_id" id="m_eid"><p class="fw-semibold small mb-2" id="m_dname"></p><input type="file" name="document_file" id="m_file" class="form-control" required><div id="m_msg" class="mt-2"></div><div class="text-muted small mt-2">Max 5 MB · PDF, JPG, PNG, DOC, DOCX</div></form></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="btnUpDoc">Upload</button></div></div></div></div>
 <div class="modal fade" id="deleteDocModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Document</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p>Delete <strong id="del_dname"></strong>?</p></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><form method="POST"><input type="hidden" name="delete_document" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="hidden" name="entrance_id" id="del_eid"><button class="btn btn-danger btn-sm">Delete</button></form></div></div></div></div>
 <div class="modal fade" id="deleteStudentModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Student</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p class="mb-0">Permanently delete <strong><?= $fullName ?></strong> and all records?</p></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><form method="POST"><input type="hidden" name="delete_student" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><button class="btn btn-danger btn-sm">Delete</button></form></div></div></div></div>
 <div class="modal fade" id="addGradeModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-plus-circle me-2"></i>Add Grade</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST"><div class="modal-body"><input type="hidden" name="student_id" value="<?= $student_id ?>"><select name="semester" class="form-select form-select-sm mb-2" required><option value="">Select Semester</option><option value="1st Semester">1st Semester</option><option value="2nd Semester">2nd Semester</option></select><select name="quarter" class="form-select form-select-sm mb-2"><option value="">Select Quarter (optional)</option><option value="1st Quarter">1st Quarter</option><option value="2nd Quarter">2nd Quarter</option><option value="3rd Quarter">3rd Quarter</option><option value="4th Quarter">4th Quarter</option></select><input name="subject_code" class="form-control form-control-sm mb-2" placeholder="Subject Code" required><input name="subject_name" class="form-control form-control-sm mb-2" placeholder="Subject Name" required><input type="number" step="0.01" name="grade" class="form-control form-control-sm mb-2" placeholder="Grade"><input name="remarks" class="form-control form-control-sm" placeholder="Remarks"></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button name="add_grade" class="btn btn-primary btn-sm">Save</button></div></form></div></div></div>
@@ -378,7 +615,7 @@ function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dar
 tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
 $('.upload-doc-btn').click(function(){$('#m_eid').val($(this).data('eid'));$('#m_dname').text($(this).data('name'));$('#m_msg').html('');$('#m_file').val('');$('#uploadDocumentModal').modal('show')});
 $('.delete-doc-btn').click(function(){$('#del_eid').val($(this).data('eid'));$('#del_dname').text($(this).data('name'));$('#deleteDocModal').modal('show')});
-$('#btnUpDoc').click(function(){var f=new FormData($('#docForm')[0]);$.ajax({url:'view_student.php',type:'POST',data:f,contentType:false,processData:false,beforeSend:function(){$('#btnUpDoc').prop('disabled',true).html('<span class="spinner-border spinner-border-sm"></span>')},success:function(){location.reload()},error:function(){$('#m_msg').html('<div class="alert alert-danger py-1 small mt-2">Failed</div>');$('#btnUpDoc').prop('disabled',false).html('Upload')}})});
+$('#btnUpDoc').click(function(){var f=new FormData($('#docForm')[0]);$.ajax({url:'view_student.php',type:'POST',data:f,contentType:false,processData:false,beforeSend:function(){$('#btnUpDoc').prop('disabled',true).html('<span class="spinner-border spinner-border-sm"></span>')},success:function(){location.reload()},error:function(){$('#m_msg').html('<div class="alert alert-danger py-1 small mt-2">Upload failed.</div>');$('#btnUpDoc').prop('disabled',false).html('Upload')}})});
 $('.edit-grd-btn').click(function(){var b=$(this);$('#eg_id').val(b.data('id'));$('#eg_sem').val(b.data('sem'));$('#eg_qtr').val(b.data('qtr'));$('#eg_code').val(b.data('code'));$('#eg_name').val(b.data('name'));$('#eg_grd').val(b.data('grd'));$('#eg_rem').val(b.data('rem'))});
 $('.del-grd-btn').click(function(){var b=$(this);$('#dg_id').val(b.data('id'));$('#dg_name').text(b.data('name'));$('#deleteGradeModal').modal('show')});
 $('.edit-edu-btn').click(function(){var b=$(this);$('#ee_id').val(b.data('id'));$('#ee_lvl').val(b.data('lvl'));$('#ee_sch').val(b.data('sch'));$('#ee_adr').val(b.data('adr'));$('#ee_yr').val(b.data('yr'))});
