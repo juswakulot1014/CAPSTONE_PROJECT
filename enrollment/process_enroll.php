@@ -1,13 +1,13 @@
 <?php
-
 // Start session only if not already active
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-// Include database only once
+// Include database and config only once
 include_once __DIR__ . "/../config/db.php";
 require_once __DIR__ . "/../config/paths.php";
+require_once __DIR__ . "/../config/crypto.php";
 
 // Check if request method is POST
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -17,7 +17,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // Verify CSRF token
-if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'] ?? '', $_POST['csrf_token'])) {
     $_SESSION['error'] = 'Invalid security token. Please try again.';
     header('Location: enroll_form.php');
     exit();
@@ -40,8 +40,188 @@ function bind_params(mysqli_stmt $stmt, array $values): void
     $stmt->bind_param($types, ...$values);
 }
 
+/**
+ * Assign a provisional section for a new enrollee.
+ *
+ * Sections are grouped by STRAND, e.g.:
+ *   "ICT Support and Computer Programming Technologies A"
+ *   "ICT Support and Computer Programming Technologies B"
+ *
+ * Algorithm:
+ *   1. Look at existing sections for the same strand / grade / SY.
+ *   2. Fill the FULLEST section that still has room (< $target_size).
+ *      That way each section reaches $target_size before the next opens.
+ *   3. If all full, open the next letter A → B → C → ... → Z.
+ *   4. If none exist yet, start with "A".
+ *
+ * Concurrency note: the caller holds a global advisory lock, so two
+ * simultaneous enrollments cannot both land in the same section.
+ * The admin "Auto Section" button rebalances if needed.
+ */
+function assignProvisionalSection(
+    mysqli $conn,
+    string $strand,
+    string $grade_level,
+    string $school_year,
+    int $target_size = 35
+): string {
+    $strand = trim($strand);
+    if ($strand === '') {
+        $strand = 'General';
+    }
+
+    $stmt = $conn->prepare("
+        SELECT section, COUNT(*) AS n
+        FROM enrollment_form
+        WHERE strand = ?
+          AND grade_level = ?
+          AND school_year = ?
+          AND section IS NOT NULL
+          AND section != ''
+        GROUP BY section
+        ORDER BY n DESC, section ASC
+    ");
+    if (!$stmt) {
+        // Fallback if prepare fails — use the first-letter name
+        return $strand . ' A';
+    }
+
+    $stmt->bind_param("sss", $strand, $grade_level, $school_year);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    // Case 1: no sections yet for this strand → start at A
+    if (empty($rows)) {
+        return $strand . ' A';
+    }
+
+    // Case 2: fill the fullest section that still has room
+    foreach ($rows as $r) {
+        if ((int)$r['n'] < $target_size) {
+            return $r['section'];
+        }
+    }
+
+    // Case 3: every existing section is full → open the next letter
+    $used_letters = [];
+    foreach ($rows as $r) {
+        if (preg_match('/\s+([A-Z])\s*$/i', $r['section'], $m)) {
+            $used_letters[strtoupper($m[1])] = true;
+        }
+    }
+
+    for ($i = 0; $i < 26; $i++) {
+        $letter = chr(65 + $i); // A..Z
+        if (!isset($used_letters[$letter])) {
+            return $strand . ' ' . $letter;
+        }
+    }
+
+    // All 26 letters in use — extremely unlikely at SHS scale.
+    return $strand . ' Z';
+}
+
+/**
+ * Encrypt and store a staged file.
+ *
+ * Reads the staged plaintext, verifies MIME, encrypts with libsodium,
+ * writes the nonce||ciphertext blob into DOCUMENTS_DIR, deletes the
+ * staged file on success, and returns file metadata for the DB row.
+ *
+ * Throws on any failure — caller's transaction rolls back.
+ */
+function store_encrypted_file(
+    string $staging_path,
+    int $student_id,
+    int $max_bytes = 5 * 1024 * 1024
+): array {
+    if (!is_file($staging_path)) {
+        throw new Exception("Staged file missing");
+    }
+    if (filesize($staging_path) > $max_bytes) {
+        throw new Exception("File too large");
+    }
+
+    $plain = file_get_contents($staging_path);
+    if ($plain === false || $plain === '') {
+        throw new Exception("Empty file");
+    }
+
+    // Re-verify MIME from the actual bytes (defense in depth).
+    $fi = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = finfo_file($fi, $staging_path);
+    finfo_close($fi);
+
+    $allowed = [
+        'application/pdf' => 'pdf',
+        'image/jpeg'      => 'jpg',
+        'image/png'       => 'png',
+    ];
+    if (!isset($allowed[$mime])) {
+        throw new Exception("Invalid file type: {$mime}");
+    }
+
+    $blob = doc_encrypt($plain);
+
+    try {
+        $token = bin2hex(random_bytes(16));
+    } catch (Exception $e) {
+        $token = bin2hex(openssl_random_pseudo_bytes(16));
+    }
+
+    $filename = "enroll_{$student_id}_{$token}.{$allowed[$mime]}.enc";
+    $abs_path = DOCUMENTS_DIR . $filename;
+
+    if (file_put_contents($abs_path, $blob, LOCK_EX) === false) {
+        throw new Exception("Cannot write encrypted file");
+    }
+    @chmod($abs_path, 0600);
+    @unlink($staging_path);
+
+    return [
+        'filename' => $filename,
+        'mime'     => $mime,
+        'size'     => strlen($plain),
+    ];
+}
+
 // Track files written to disk in case we need to clean up on rollback
 $written_files = [];
+
+// ── Server-side age recompute (never trust the client-posted value) ──
+if (empty($_POST['birth_date'])) {
+    $_SESSION['error'] = 'Birth date is required.';
+    header('Location: enroll_form.php');
+    exit();
+}
+$birth = DateTime::createFromFormat('Y-m-d', $_POST['birth_date']);
+if (!$birth) {
+    $_SESSION['error'] = 'Invalid birth date.';
+    header('Location: enroll_form.php');
+    exit();
+}
+$real_age = (new DateTime())->diff($birth)->y;
+if ($real_age < 14 || $real_age > 25) {
+    $_SESSION['error'] = 'Age must be between 14 and 25.';
+    header('Location: enroll_form.php');
+    exit();
+}
+$_POST['age'] = $real_age;
+
+// ── Serialize concurrent enrollments (section + student ID sequence) ──
+$got_lock = false;
+$lock_res = $conn->query("SELECT GET_LOCK('enroll_global', 10) AS ok");
+if ($lock_res) {
+    $lock_row = $lock_res->fetch_assoc();
+    $got_lock = ((int)($lock_row['ok'] ?? 0) === 1);
+    $lock_res->free();
+}
+if (!$got_lock) {
+    $_SESSION['error'] = 'System busy, please try again in a moment.';
+    header('Location: enroll_form.php');
+    exit();
+}
 
 // Begin transaction
 $conn->begin_transaction();
@@ -76,7 +256,7 @@ try {
     $email = !empty($_POST['email']) ? $_POST['email'] : null;
     $phone = !empty($_POST['phone']) ? $_POST['phone'] : null;
     $special_skills = !empty($_POST['special_skills']) ? $_POST['special_skills'] : null;
-    $photo = null; // No photo uploaded in this version
+    $photo = null;
 
     bind_params($stmt, [
         $lrn,
@@ -193,12 +373,16 @@ try {
 
     // ============================================
     // 4. INSERT INTO parents_info
+    //
+    // FIX: mother_name is no longer populated from mother_maiden_name.
+    // The form does not collect a separate mother full-name field, so we
+    // insert NULL instead of duplicating the maiden name into both columns.
     // ============================================
     $stmt = $conn->prepare("INSERT INTO parents_info 
         (student_id, father_name, father_occupation, father_contact, mother_name,
          mother_maiden_name, mother_occupation, mother_contact, ave_family_income, 
          is_4ps, guardian_fullname, guardian_relation, guardian_contact, household_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
     if (!$stmt) {
         throw new Exception("Prepare failed for parents_info: " . $conn->error);
@@ -207,7 +391,6 @@ try {
     $father_name = $_POST['father_name'] ?? null;
     $father_occupation = $_POST['father_occupation'] ?? null;
     $father_contact = $_POST['father_contact'] ?? null;
-    $mother_name = $_POST['mother_maiden_name'] ?? null;
     $mother_maiden_name = $_POST['mother_maiden_name'] ?? null;
     $mother_occupation = $_POST['mother_occupation'] ?? null;
     $mother_contact = $_POST['mother_contact'] ?? null;
@@ -223,7 +406,6 @@ try {
         $father_name,
         $father_occupation,
         $father_contact,
-        $mother_name,
         $mother_maiden_name,
         $mother_occupation,
         $mother_contact,
@@ -278,6 +460,9 @@ try {
 
     // ============================================
     // 6. INSERT INTO enrollment_form
+    //
+    // Section is assigned automatically based on the strand.
+    // If a section was posted (future admin-side form), respect it.
     // ============================================
     $stmt = $conn->prepare("INSERT INTO enrollment_form 
         (student_id, school_year, grade_level, semester, track, strand, program, section,
@@ -293,9 +478,32 @@ try {
     $grade_level = $_POST['grade_level'] ?? '';
     $semester = $_POST['semester'] ?? '';
     $track = $_POST['track'] ?? 'TECHPRO ELECTIVES';
-    $strand = $_POST['strand'] ?? '';
+    $strand = trim((string)($_POST['strand'] ?? ''));
+    if ($strand === '') {
+        // Fallback if strand is somehow empty (should not happen given validation)
+        $strand = trim((string)($_POST['program'] ?? ''));
+    }
+    if ($strand === '') {
+        $strand = 'General';
+    }
     $program = $_POST['program'] ?? '';
-    $section = !empty($_POST['section']) ? $_POST['section'] : $strand;
+
+    // ============ SECTION ASSIGNMENT ============
+    if (!empty($_POST['section'])) {
+        // Manual override (future admin-side enroll)
+        $section = trim($_POST['section']);
+    } else {
+        // Auto-assign based on current strand distribution
+        $section = assignProvisionalSection(
+            $conn,
+            $strand,
+            $grade_level,
+            $school_year,
+            35 // target per section; adjust if needed
+        );
+    }
+    // ============================================
+
     $household_id = $_POST['household_id'] ?? null;
     $is_transferred = isset($_POST['is_transferred']) ? 1 : 0;
     $previous_school_name = $_POST['previous_school_name'] ?? null;
@@ -338,15 +546,35 @@ try {
 
     // ============================================
     // 7. INSERT entrance document checkboxes (no file)
+    //
+    // Skip any label that has a matching uploaded file in section 8 —
+    // otherwise the admin view shows two rows for the same document.
     // ============================================
+    $uploaded_labels = [];
+    if (!empty($_SESSION['uploaded_files']) && is_array($_SESSION['uploaded_files'])) {
+        foreach ($_SESSION['uploaded_files'] as $f) {
+            $lbl = trim((string)($f['label'] ?? ''));
+            if ($lbl !== '') {
+                $uploaded_labels[$lbl] = true;
+            }
+        }
+    }
+
     if (!empty($_POST['entrance_data']) && is_array($_POST['entrance_data'])) {
         $doc_stmt = $conn->prepare("INSERT INTO entrance_documents 
-            (student_id, document_name) 
-            VALUES (?, ?)");
+            (student_id, document_name, submitted) 
+            VALUES (?, ?, 0)");
 
         if ($doc_stmt) {
             foreach ($_POST['entrance_data'] as $document) {
-                bind_params($doc_stmt, [$student_info_id, $document]);
+                $document = trim((string)$document);
+                if ($document === '') {
+                    continue;
+                }
+                if (isset($uploaded_labels[$document])) {
+                    continue; // section 8 will insert the file row
+                }
+                bind_params($doc_stmt, [$student_info_id, $document, 0]);
                 $doc_stmt->execute();
             }
             $doc_stmt->close();
@@ -354,16 +582,21 @@ try {
     }
 
     // ============================================
-    // 8. SAVE UPLOADED FILES TO PRIVATE STORAGE (disk, not BLOB)
+    // 8. SAVE STAGED FILES — ENCRYPTED AT REST
+    //
+    // Files were previously held in $_SESSION as base64 blobs. They now
+    // live in STAGING_DIR as plaintext (short-lived); we read them here,
+    // encrypt with libsodium, write the .enc blob into DOCUMENTS_DIR
+    // (outside webroot), then delete the staged plaintext.
     // ============================================
     if (!empty($_SESSION['uploaded_files']) && is_array($_SESSION['uploaded_files'])) {
 
-        // Safety limit: don't allow more than 10 files per enrollment
         if (count($_SESSION['uploaded_files']) > 10) {
             throw new Exception("Too many files uploaded (max 10).");
         }
 
-        $uploaded_by = $_SESSION['user_id'] ?? null;
+        // Prefer admin_id (what the admin login sets), fall back to user_id
+        $uploaded_by = $_SESSION['admin_id'] ?? $_SESSION['user_id'] ?? null;
 
         if ($uploaded_by !== null) {
             $file_stmt = $conn->prepare("INSERT INTO entrance_documents 
@@ -379,85 +612,29 @@ try {
             throw new Exception("Prepare failed for file insert: " . $conn->error);
         }
 
-        // Allowed MIME types (real content, not client-declared)
-        $allowed_mime = [
-            'application/pdf'  => 'pdf',
-            'image/jpeg'       => 'jpg',
-            'image/png'        => 'png',
-        ];
+        foreach ($_SESSION['uploaded_files'] as $doc_key => $info) {
+            $label   = $info['label'] ?? $doc_key;
+            $staging = $info['staging_path'] ?? '';
+            $name    = $info['name'] ?? $label;
 
-        $max_file_bytes = 5 * 1024 * 1024; // 5 MB
-
-        if (!is_dir(DOCUMENTS_DIR)) {
-            mkdir(DOCUMENTS_DIR, 0755, true);
-        }
-
-        foreach ($_SESSION['uploaded_files'] as $file) {
-            $label       = $file['label'] ?? 'Document';
-            $data        = $file['data']  ?? '';
-            $declared_mime = $file['mime'] ?? '';
-            $name        = $file['name']  ?? $label;
-
-            // Decode base64
-            $binary_data = base64_decode($data, true);
-            if ($binary_data === false || $binary_data === '') {
-                continue; // skip invalid
+            if ($staging === '' || !is_file($staging)) {
+                continue; // already consumed
             }
 
-            // Size cap
-            if (strlen($binary_data) > $max_file_bytes) {
-                throw new Exception("File too large: " . $label . " (max 5 MB).");
-            }
+            $stored = store_encrypted_file($staging, $student_info_id);
+            $written_files[] = DOCUMENTS_DIR . $stored['filename'];
 
-            // Write to temp, then verify MIME from content
-            $tmp = tempnam(sys_get_temp_dir(), 'enroll_');
-            if ($tmp === false) {
-                throw new Exception("Cannot create temp file.");
-            }
-            if (file_put_contents($tmp, $binary_data) === false) {
-                @unlink($tmp);
-                throw new Exception("Failed to stage file: " . $label);
-            }
-
-            $fi = finfo_open(FILEINFO_MIME_TYPE);
-            $real_mime = finfo_file($fi, $tmp);
-            finfo_close($fi);
-
-            if (!isset($allowed_mime[$real_mime])) {
-                @unlink($tmp);
-                throw new Exception("Invalid file type for '{$label}': {$real_mime}. Only PDF, JPG, PNG allowed.");
-            }
-
-            // Random, unguessable filename
-            $ext = $allowed_mime[$real_mime];
-            try {
-                $token = bin2hex(random_bytes(16));
-            } catch (Exception $e) {
-                $token = bin2hex(openssl_random_pseudo_bytes(16));
-            }
-            $filename = "enroll_{$student_info_id}_{$token}.{$ext}";
-            $abs_path = DOCUMENTS_DIR . $filename;
-
-            if (!rename($tmp, $abs_path)) {
-                @unlink($tmp);
-                throw new Exception("Failed to save file: " . $label);
-            }
-
-            // Track for rollback cleanup
-            $written_files[] = $abs_path;
-
-            // Sanitize original filename for storage
             $safe_name = preg_replace('/[^A-Za-z0-9._\- ]/', '_', $name);
             if ($safe_name === '' || $safe_name === null) {
-                $safe_name = $filename;
+                $safe_name = $stored['filename'];
             }
 
             if ($uploaded_by !== null) {
                 bind_params($file_stmt, [
                     $student_info_id,
                     $label,
-                    $filename,
-                    $real_mime,
+                    $stored['filename'],
+                    $stored['mime'],
                     $safe_name,
                     (int)$uploaded_by,
                 ]);
@@ -465,8 +642,8 @@ try {
                 bind_params($file_stmt, [
                     $student_info_id,
                     $label,
-                    $filename,
-                    $real_mime,
+                    $stored['filename'],
+                    $stored['mime'],
                     $safe_name,
                 ]);
             }
@@ -482,6 +659,10 @@ try {
     // COMMIT TRANSACTION
     // ============================================
     $conn->commit();
+    $conn->query("SELECT RELEASE_LOCK('enroll_global')");
+
+    // Rotate CSRF token after successful submission
+    unset($_SESSION['csrf_token']);
 
     $_SESSION['success'] = true;
     $_SESSION['success_message'] = "Student successfully enrolled!<br><br>
@@ -491,9 +672,9 @@ try {
         <strong>Birth Date:</strong> " . htmlspecialchars($birth_date) . "<br>
         <strong>School Year:</strong> " . htmlspecialchars($school_year) . "<br>
         <strong>Grade Level:</strong> " . htmlspecialchars($grade_level) . "<br>
-        <strong>Strand:</strong> " . htmlspecialchars($strand);
+        <strong>Strand:</strong> " . htmlspecialchars($strand) . "<br>
+        <strong>Section:</strong> " . htmlspecialchars($section);
 
-    // Clear session data after successful enrollment
     unset($_SESSION['form_data']);
     unset($_SESSION['uploaded_files']);
 
@@ -502,18 +683,21 @@ try {
 
 } catch (Exception $e) {
     $conn->rollback();
+    $conn->query("SELECT RELEASE_LOCK('enroll_global')");
 
-    // Clean up any files written to disk during this failed enrollment
+    // Clean up any encrypted files we managed to write before the failure
     foreach ($written_files as $abs) {
         if (file_exists($abs)) {
             @unlink($abs);
         }
     }
 
-    error_log("Enrollment Error: " . $e->getMessage());
-    error_log("Error Trace: " . $e->getTraceAsString());
+    // Log full details, show only a correlation ID to the user
+    $corr = bin2hex(random_bytes(4));
+    error_log("Enrollment Error [{$corr}]: " . $e->getMessage());
+    error_log("Error Trace [{$corr}]: " . $e->getTraceAsString());
 
-    $_SESSION['error'] = 'Failed to enroll student. Error: ' . $e->getMessage();
+    $_SESSION['error'] = 'Failed to enroll student. Please try again. Reference: ' . $corr;
 
     header('Location: enroll_form.php');
     exit();
