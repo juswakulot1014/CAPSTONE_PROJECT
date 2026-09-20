@@ -9,7 +9,7 @@ $remember_duration_days = 30;
 $remember_duration_seconds = 86400 * $remember_duration_days;
 
 // Rate limiting
-$max_attempts = 5;
+$max_attempts = 3;
 $lockout_time = 900; // 15 minutes
 $rate_limit_key = 'login_attempts_' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
 

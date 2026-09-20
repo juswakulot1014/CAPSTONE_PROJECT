@@ -9,73 +9,69 @@ $success = "";
 // SECURITY: Require authentication
 // ============================================
 if (!isset($_SESSION['admin_id'])) {
-    // Store intended page for redirect after login
     $_SESSION['redirect_after_login'] = 'change_user_password.php';
     header("Location: admin_login.php");
     exit();
 }
 
-// Verify session integrity
+// Require superadmin role
+if (($_SESSION['admin_role'] ?? '') !== 'superadmin') {
+    $_SESSION['error'] = "Access Denied! Only the Principal can change passwords.";
+    header("Location: dashboard.php");
+    exit();
+}
+
+// Session integrity
 if (isset($_SESSION['user_agent']) && $_SESSION['user_agent'] !== ($_SERVER['HTTP_USER_AGENT'] ?? '')) {
     session_destroy();
     header("Location: admin_login.php?timeout=1");
     exit();
 }
 
-// ============================================
-// SECURITY: CSRF Protection
-// ============================================
+// CSRF
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
-// Rate limiting for password changes
-$max_attempts = 3;
-$lockout_time = 900; // 15 minutes
+// Rate limiting
+$max_attempts   = 3;
+$lockout_time   = 900; // 15 minutes
 $rate_limit_key = 'pwd_change_attempts_' . $_SESSION['admin_id'];
-
 if (!isset($_SESSION[$rate_limit_key])) {
     $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
 }
 
 // ============================================
-// Process form submission
+// POST handling
 // ============================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    
-    // Check rate limit
+
     if ($_SESSION[$rate_limit_key]['count'] >= $max_attempts) {
-        $time_since_last = time() - $_SESSION[$rate_limit_key]['last_attempt'];
-        if ($time_since_last < $lockout_time) {
-            $remaining = ceil(($lockout_time - $time_since_last) / 60);
+        $since = time() - $_SESSION[$rate_limit_key]['last_attempt'];
+        if ($since < $lockout_time) {
+            $remaining = ceil(($lockout_time - $since) / 60);
             $error = "Too many attempts. Please try again in {$remaining} minute(s).";
         } else {
             $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
         }
     }
-    
-    // Validate CSRF token
+
     if (empty($error)) {
-        if (!isset($_POST['csrf_token']) || !isset($_SESSION['csrf_token']) || 
-            !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
             $error = "Invalid security token. Please refresh the page and try again.";
         }
     }
-    
-    // Validate admin password confirmation (prevent unauthorized changes)
+
     if (empty($error)) {
         $admin_password = $_POST['admin_password'] ?? '';
-        
         if (empty($admin_password)) {
             $error = "Please enter your own admin password for verification.";
         } else {
-            // Verify the logged-in admin's password
             $verify_stmt = $conn->prepare("SELECT password FROM admins WHERE id = ? LIMIT 1");
             if ($verify_stmt) {
                 $verify_stmt->bind_param("i", $_SESSION['admin_id']);
                 $verify_stmt->execute();
                 $verify_result = $verify_stmt->get_result();
-                
                 if ($verify_result->num_rows === 1) {
                     $admin_data = $verify_result->fetch_assoc();
                     if (!password_verify($admin_password, $admin_data['password'])) {
@@ -89,14 +85,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     }
-    
-    // Process the password change
+
     if (empty($error)) {
-        $target_username = trim($_POST['username'] ?? '');
-        $new_password = $_POST['new_password'] ?? ''; // Don't trim passwords
+        $target_username  = trim($_POST['username'] ?? '');
+        $new_password     = $_POST['new_password'] ?? '';
         $confirm_password = $_POST['confirm_password'] ?? '';
 
-        // Validate inputs
         if (empty($target_username) || empty($new_password) || empty($confirm_password)) {
             $error = "Please fill in all fields.";
         } elseif ($new_password !== $confirm_password) {
@@ -114,27 +108,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } elseif (!preg_match('/[^A-Za-z0-9]/', $new_password)) {
             $error = "Password must contain at least one special character.";
         } else {
-            // SECURITY: Prevent changing own password through this tool
             $current_admin_stmt = $conn->prepare("SELECT username FROM admins WHERE id = ? LIMIT 1");
             if ($current_admin_stmt) {
                 $current_admin_stmt->bind_param("i", $_SESSION['admin_id']);
                 $current_admin_stmt->execute();
-                $current_result = $current_admin_stmt->get_result();
-                $current_admin = $current_result->fetch_assoc();
+                $current_admin = $current_admin_stmt->get_result()->fetch_assoc();
                 $current_admin_stmt->close();
-                
                 if ($current_admin && strcasecmp($target_username, $current_admin['username']) === 0) {
                     $error = "For security reasons, you cannot change your own password here. Please use the profile settings instead.";
-                    error_log("Admin ID {$_SESSION['admin_id']} attempted to change own password via admin tool");
                 }
             }
         }
-        
-        // Proceed with password change
+
         if (empty($error)) {
-            // SECURITY: Use prepared statement with limited info disclosure
             $stmt = $conn->prepare("SELECT id, fullname, username, role FROM admins WHERE username = ? LIMIT 1");
-            
             if ($stmt) {
                 $stmt->bind_param("s", $target_username);
                 $stmt->execute();
@@ -142,726 +129,704 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 if ($result->num_rows === 1) {
                     $user = $result->fetch_assoc();
-                    
-                    // SECURITY: Check if target user is superadmin (extra protection)
                     if ($user['role'] === 'superadmin' && $_SESSION['admin_role'] !== 'superadmin') {
                         $error = "You do not have permission to change this user's password.";
-                        error_log("Non-superadmin attempted to change superadmin password. Admin ID: {$_SESSION['admin_id']}");
                     } else {
-                        $hashed_password = password_hash($new_password, PASSWORD_DEFAULT, [
-                            'cost' => 12 // Increased cost for better security
-                        ]);
-
-                        // Update password and clear any reset tokens
+                        $hashed_password = password_hash($new_password, PASSWORD_DEFAULT, ['cost' => 12]);
                         $upd = $conn->prepare("UPDATE admins SET password = ?, reset_token = NULL, reset_expires = NULL WHERE id = ?");
-                        
                         if ($upd) {
                             $upd->bind_param("si", $hashed_password, $user['id']);
                             $upd->execute();
 
                             if ($upd->affected_rows > 0) {
-                                // Reset rate limit on success
                                 $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
-                                
-                                // Regenerate CSRF token after successful action
                                 $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-                                
-                                $success = "Password successfully updated for user.";
-                                
-                                // SECURITY: Log the password change
-                                $log_message = sprintf(
+                                $success = "Password successfully updated for user: " . htmlspecialchars($target_username);
+
+                                error_log(sprintf(
                                     "[%s] Password changed for user '%s' (ID: %d) by admin '%s' (ID: %d) from IP: %s",
                                     date('Y-m-d H:i:s'),
                                     $target_username,
                                     $user['id'],
-                                    $_SESSION['admin_name'],
+                                    $_SESSION['admin_name'] ?? 'unknown',
                                     $_SESSION['admin_id'],
                                     $_SERVER['REMOTE_ADDR'] ?? 'unknown'
-                                );
-                                error_log($log_message);
-                                
-                                // Clear form data
+                                ));
                                 unset($_POST['username'], $_POST['new_password'], $_POST['confirm_password']);
-                                
                             } else {
                                 $error = "Failed to update password. Please try again.";
-                                error_log("Password update query affected 0 rows for user ID: {$user['id']}");
                             }
                             $upd->close();
                         } else {
                             $error = "System error. Please try again later.";
-                            error_log("Database prepare failed for password update: " . $conn->error);
                         }
                     }
                 } else {
-                    // SECURITY: Generic error message to prevent username enumeration
                     $_SESSION[$rate_limit_key]['count']++;
                     $_SESSION[$rate_limit_key]['last_attempt'] = time();
-                    
                     $error = "Could not process your request. Please verify the username and try again.";
-                    error_log("Password change attempted for non-existent username from admin ID: {$_SESSION['admin_id']}");
                 }
                 $stmt->close();
             } else {
                 $error = "System error. Please try again later.";
-                error_log("Database prepare failed in change_user_password.php: " . $conn->error);
             }
         }
     }
 }
 
-// Regenerate CSRF token for the form
 $csrf_token = $_SESSION['csrf_token'];
-
-// Get current admin info for the form
 $admin_name = htmlspecialchars($_SESSION['admin_name'] ?? 'Administrator', ENT_QUOTES, 'UTF-8');
+
+$attempts_used = (int)$_SESSION[$rate_limit_key]['count'];
+$attempts_left = max(0, $max_attempts - $attempts_used);
+$locked_until  = 0;
+if ($attempts_used >= $max_attempts) {
+    $since = time() - $_SESSION[$rate_limit_key]['last_attempt'];
+    if ($since < $lockout_time) $locked_until = ceil(($lockout_time - $since) / 60);
+}
+
+$theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 'dark' : 'light';
 ?>
 
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-bs-theme="<?= $theme ?>">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Change User Password • USAT Admin</title>
-    
-    <!-- Security headers -->
-    <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="robots" content="noindex, nofollow">
-    
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
-
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
     <style>
-        :root { 
-            --primary: #1e40af; 
-            --primary-light: #3b82f6;
-            --primary-dark: #1e3a8a;
-            --success: #10b981;
-            --error: #ef4444;
-            --warning: #f59e0b;
-            --text-primary: #1e293b;
-            --text-secondary: #64748b;
-            --border-color: #e2e8f0;
-            --bg-glass: rgba(255, 255, 255, 0.97);
+        :root {
+            --bg: #f1f5f9; --surface: #ffffff; --surface2: #f8fafc;
+            --text: #1a1f36; --text2: #6b7280;
+            --border: #e5e7eb; --accent: #4f46e5; --accent2: #6366f1;
+            --green: #059669; --red: #dc2626; --amber: #d97706;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+            --shadow: 0 1px 3px rgba(0,0,0,0.06);
+            --shadow-lg: 0 10px 25px rgba(0,0,0,0.08);
+            --radius: 12px; --radius-lg: 16px;
         }
-
-        [data-theme="dark"] {
-            --primary: #60a5fa;
-            --primary-light: #93c5fd;
-            --primary-dark: #3b82f6;
-            --text-primary: #f1f5f9;
-            --text-secondary: #94a3b8;
-            --border-color: #475569;
-            --bg-glass: rgba(30, 41, 59, 0.97);
+        [data-bs-theme="dark"] {
+            --bg: #0f172a; --surface: #1e293b; --surface2: #1a2436;
+            --text: #f1f5f9; --text2: #94a3b8;
+            --border: #334155; --accent: #818cf8; --accent2: #6366f1;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
+            --shadow: 0 1px 3px rgba(0,0,0,0.3);
+            --shadow-lg: 0 10px 25px rgba(0,0,0,0.5);
         }
+        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
+        body{background:var(--bg);color:var(--text);min-height:100vh}
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        /* ===== Sidebar ===== */
+        .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
+        .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
+        .sidebar-brand img{width:40px;height:40px;border-radius:10px}
+        .sidebar-brand span{font-weight:700;font-size:1.1rem}
+        .sidebar-nav{flex:1;padding:1rem 0.75rem;overflow-y:auto}
+        .sidebar-nav a{display:flex;align-items:center;gap:0.75rem;padding:0.7rem 1rem;border-radius:10px;color:var(--text2);text-decoration:none;font-weight:500;font-size:0.9rem;transition:all 0.2s;margin-bottom:0.25rem}
+        .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
+        .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
+        .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
 
-        body {
-            font-family: 'Inter', system-ui, -apple-system, sans-serif;
-            background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 40%, #1e40af 100%);
-            background-size: 400% 400%;
-            animation: gradientShift 35s ease infinite;
-            min-height: 100vh;
+        /* ===== Main ===== */
+        .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
+        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
+        .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
+        .breadcrumb-nav{display:flex;align-items:center;gap:0.5rem;font-size:0.82rem;color:var(--text2);margin-bottom:0.25rem}
+        .breadcrumb-nav a{color:var(--accent);text-decoration:none;font-weight:500}
+        .breadcrumb-nav a:hover{text-decoration:underline}
+
+        .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.15s}
+        .theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}
+
+        /* ===== Centered form card ===== */
+        .cw-wrap {
+            max-width: 640px;
+            margin: 0 auto;
+            animation: cw-fade 0.25s ease;
+        }
+        @keyframes cw-fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+        .cw-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }
+        .cw-card-head {
             display: flex;
             align-items: center;
-            justify-content: center;
-            padding: 2rem 1rem;
-            -webkit-font-smoothing: antialiased;
+            gap: 0.85rem;
+            padding: 1.15rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(180deg, var(--surface), var(--surface2));
         }
-
-        @keyframes gradientShift {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
+        [data-bs-theme="dark"] .cw-card-head {
+            background: linear-gradient(180deg, var(--surface), var(--surface2));
         }
-
-        .container {
-            width: 100%;
-            max-width: 960px;
-        }
-
-        .card {
-            display: flex;
-            background: var(--bg-glass);
-            backdrop-filter: blur(32px);
-            -webkit-backdrop-filter: blur(32px);
-            border-radius: 28px;
-            overflow: hidden;
-            box-shadow: 0 40px 100px rgba(30,58,138,0.55);
-            min-height: 540px;
-            border: 1px solid rgba(255,255,255,0.6);
-        }
-
-        .left {
-            flex: 1;
-            background: linear-gradient(135deg, var(--primary-dark), var(--primary));
-            padding: 4rem 3rem;
+        .cw-card-head-icon {
+            width: 42px; height: 42px;
+            border-radius: 11px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
             color: white;
-            text-align: center;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            position: relative;
-            overflow: hidden;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 1.1rem;
+            flex-shrink: 0;
+            box-shadow: 0 4px 12px rgba(79,70,229,0.35);
         }
-
-        .left::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
-            animation: pulse 4s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); opacity: 0.3; }
-            50% { transform: scale(1.1); opacity: 0.5; }
-        }
-
-        .logo { 
-            width: 140px; 
-            height: 140px; 
-            border-radius: 50%; 
-            border: 4px solid rgba(255,255,255,0.9); 
-            margin-bottom: 2rem;
-            position: relative;
-            z-index: 1;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.3);
-        }
-
-        .left h1 {
-            position: relative;
-            z-index: 1;
-            font-family: 'Playfair Display', serif;
-            font-size: 2.4rem;
-            font-weight: 800;
-            margin-bottom: 0.5rem;
-        }
-
-        .left .admin-info {
-            position: relative;
-            z-index: 1;
-            margin-top: 2rem;
-            padding: 1rem 1.5rem;
-            background: rgba(255,255,255,0.15);
-            border-radius: 12px;
-            font-size: 0.95rem;
-            backdrop-filter: blur(5px);
-        }
-
-        .right {
-            flex: 1.15;
-            padding: 3.5rem 4rem;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .right h2 {
-            font-size: 1.8rem;
-            color: var(--text-primary);
-            margin-bottom: 0.5rem;
-            font-weight: 700;
-        }
-
-        .subtitle {
-            color: var(--text-secondary);
-            margin-bottom: 2rem;
+        .cw-card-head h3 {
             font-size: 1rem;
+            font-weight: 700;
+            margin: 0 0 0.1rem;
+            color: var(--text);
         }
-
-        .form-group {
-            position: relative;
-            margin-bottom: 1.5rem;
+        .cw-card-head p {
+            font-size: 0.82rem;
+            color: var(--text2);
+            margin: 0;
         }
+        .cw-card-body { padding: 1.5rem; }
 
-        .form-group label {
+        /* ===== Form ===== */
+        .cw-field { margin-bottom: 1.15rem; }
+        .cw-field-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.4rem;
+        }
+        .cw-field label {
             display: block;
-            margin-bottom: 0.5rem;
-            color: var(--text-primary);
-            font-weight: 600;
-            font-size: 0.95rem;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: var(--text2);
+            text-transform: uppercase;
+            letter-spacing: 0.55px;
+            margin-bottom: 0.4rem;
+        }
+        .cw-field-head label { margin-bottom: 0; }
+        .cw-charcount {
+            font-size: 0.72rem;
+            color: var(--text2);
+            font-variant-numeric: tabular-nums;
+            font-weight: 500;
         }
 
-        .form-group .icon-wrapper {
-            position: relative;
+        .cw-input-wrap { position: relative; }
+        .cw-input-wrap input {
+            width: 100%;
+            padding: 0.8rem 2.75rem 0.8rem 2.6rem;
+            border: 1.5px solid var(--border);
+            border-radius: 11px;
+            font-size: 0.92rem;
+            background: var(--bg);
+            color: var(--text);
+            font-family: inherit;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
         }
+        .cw-input-wrap input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(79,70,229,0.15);
+            background: var(--surface);
+        }
+        .cw-input-wrap input::placeholder { color: var(--text2); opacity: 0.65; }
 
-        .form-group .icon-wrapper i {
+        .cw-input-icon {
             position: absolute;
-            left: 1.2rem;
+            left: 0.95rem;
             top: 50%;
             transform: translateY(-50%);
-            color: var(--text-secondary);
-            font-size: 1.2rem;
-            transition: color 0.3s ease;
-            z-index: 2;
+            color: var(--text2);
+            font-size: 1rem;
+            pointer-events: none;
+            transition: color 0.15s ease;
         }
-
-        .form-group input {
-            width: 100%;
-            padding: 1.2rem 1.2rem 1.2rem 3.5rem;
-            border: 2px solid var(--border-color);
-            border-radius: 12px;
-            font-size: 1.05rem;
-            background: white;
-            color: var(--text-primary);
-            transition: all 0.3s ease;
-            font-family: 'Inter', sans-serif;
+        .cw-input-wrap input:focus ~ .cw-input-icon {
+            color: var(--accent);
         }
-
-        [data-theme="dark"] .form-group input {
-            background: #1e2937;
-            border-color: #475569;
-            color: #f1f5f9;
-        }
-
-        .form-group input:focus {
-            outline: none;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.15);
-        }
-
-        .form-group input:focus + i,
-        .form-group input:focus ~ i {
-            color: var(--primary);
-        }
-
-        .password-requirements {
-            background: linear-gradient(135deg, #eff6ff, #dbeafe);
-            padding: 1rem 1.2rem;
-            border-radius: 12px;
-            margin-bottom: 1.5rem;
-            font-size: 0.85rem;
-            color: #1e40af;
-            border-left: 4px solid var(--primary);
-        }
-
-        [data-theme="dark"] .password-requirements {
-            background: linear-gradient(135deg, #1e2937, #1e3a5f);
-            color: #93c5fd;
-        }
-
-        .password-requirements ul {
-            list-style: none;
-            padding: 0;
-            margin: 0.5rem 0 0 0;
-        }
-
-        .password-requirements li {
-            padding: 0.25rem 0;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .password-requirements li i {
-            font-size: 0.8rem;
-            width: 1rem;
-            text-align: center;
-        }
-
-        .btn {
-            width: 100%;
-            padding: 1.3rem;
-            background: linear-gradient(135deg, var(--primary), var(--primary-light));
-            color: white;
+        .cw-eye {
+            position: absolute;
+            right: 0.5rem;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 32px;
+            height: 32px;
             border: none;
-            border-radius: 12px;
-            font-size: 1.15rem;
-            font-weight: 700;
+            background: transparent;
+            color: var(--text2);
             cursor: pointer;
-            transition: all 0.3s ease;
+            border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 0.75rem;
-            box-shadow: 0 8px 25px rgba(30, 58, 138, 0.3);
-            position: relative;
-            overflow: hidden;
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+        .cw-eye:hover { background: var(--bg); color: var(--accent); }
+        [data-bs-theme="dark"] .cw-eye:hover { background: var(--surface2); }
+
+        .cw-hint {
+            margin: 0.45rem 0 0;
+            font-size: 0.78rem;
+            color: var(--text2);
+            line-height: 1.4;
         }
 
-        .btn::before {
+        /* ===== Divider ===== */
+        .cw-divider {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin: 1.5rem 0 1.15rem;
+        }
+        .cw-divider::before,
+        .cw-divider::after {
             content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
-            transition: left 0.5s ease;
+            flex: 1;
+            height: 1px;
+            background: var(--border);
         }
-
-        .btn:hover::before {
-            left: 100%;
-        }
-
-        .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 12px 35px rgba(30, 58, 138, 0.4);
-        }
-
-        .btn:disabled {
-            opacity: 0.7;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .error { 
-            background: #fef2f2;
-            color: #991b1b;
-            padding: 1rem 1.2rem;
-            border-radius: 12px;
-            text-align: left;
-            margin-bottom: 1.5rem;
-            font-size: 0.95rem;
-            border-left: 4px solid var(--error);
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            animation: slideIn 0.3s ease;
-        }
-
-        .success { 
-            background: #ecfdf5;
-            color: #065f46;
-            padding: 1.2rem 1.5rem;
-            border-radius: 12px;
-            text-align: left;
-            margin-bottom: 1.5rem;
-            font-size: 1rem;
-            border-left: 4px solid var(--success);
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            animation: slideIn 0.3s ease;
-        }
-
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateY(-10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .back-link {
-            text-align: center;
-            margin-top: 2rem;
-        }
-
-        .back-link a {
-            color: var(--primary);
-            font-weight: 600;
-            text-decoration: none;
-            transition: color 0.3s ease;
+        .cw-divider span {
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--text2);
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            white-space: nowrap;
             display: inline-flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 0.35rem;
         }
+        .cw-divider span i { font-size: 0.75rem; color: var(--accent); }
 
-        .back-link a:hover {
-            color: var(--primary-light);
+        /* ===== Strength meter — segmented ===== */
+        .cw-strength {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 4px;
+            margin-top: 0.55rem;
         }
+        .cw-strength-seg {
+            height: 5px;
+            border-radius: 3px;
+            background: var(--border);
+            transition: background 0.2s ease;
+        }
+        .cw-strength-seg.active-weak   { background: var(--red); }
+        .cw-strength-seg.active-medium { background: var(--amber); }
+        .cw-strength-seg.active-strong { background: var(--green); }
 
-        /* Theme Toggle */
-        .theme-toggle {
-            position: fixed;
-            top: 2rem;
-            right: 2rem;
-            background: rgba(255,255,255,0.2);
-            backdrop-filter: blur(10px);
-            border: 2px solid rgba(255,255,255,0.3);
-            width: 48px;
-            height: 48px;
-            border-radius: 50%;
-            color: white;
-            font-size: 1.4rem;
-            cursor: pointer;
-            z-index: 100;
-            transition: all 0.3s ease;
+        .cw-reqs {
             display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin-top: 0.6rem;
+        }
+        .cw-req {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.22rem 0.6rem;
+            border-radius: 20px;
+            font-size: 0.7rem;
+            font-weight: 600;
+            background: var(--bg);
+            color: var(--text2);
+            border: 1px solid var(--border);
+            transition: all 0.15s ease;
+        }
+        .cw-req i {
+            font-size: 0.6rem;
+            color: var(--text2);
+            opacity: 0.55;
+            transition: all 0.15s ease;
+        }
+        .cw-req.met {
+            background: #ecfdf5;
+            color: #065f46;
+            border-color: #6ee7b7;
+        }
+        .cw-req.met i {
+            color: #10b981;
+            opacity: 1;
+        }
+        [data-bs-theme="dark"] .cw-req.met {
+            background: #064e3b;
+            color: #6ee7b7;
+            border-color: #065f46;
+        }
+        [data-bs-theme="dark"] .cw-req.met i {
+            color: #34d399;
+        }
+
+        /* ===== Submit ===== */
+        .cw-submit {
+            width: 100%;
+            padding: 0.9rem 1.25rem;
+            border: none;
+            border-radius: 11px;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            color: white;
+            font-size: 0.95rem;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            display: inline-flex;
             align-items: center;
             justify-content: center;
+            gap: 0.5rem;
+            box-shadow: 0 4px 14px rgba(79,70,229,0.3);
+            transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+            margin-top: 0.75rem;
+            letter-spacing: 0.2px;
         }
-
-        .theme-toggle:hover {
-            background: rgba(255,255,255,0.3);
-            transform: scale(1.1);
+        .cw-submit:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 18px rgba(79,70,229,0.4);
         }
-
-        .strength-meter {
-            height: 4px;
-            border-radius: 2px;
-            margin-top: 0.5rem;
-            transition: all 0.3s ease;
-            background: #e2e8f0;
+        .cw-submit:active:not(:disabled) {
+            transform: translateY(0);
         }
+        .cw-submit:disabled { opacity: 0.65; cursor: not-allowed; }
 
-        .strength-meter.weak { background: var(--error); width: 33%; }
-        .strength-meter.medium { background: var(--warning); width: 66%; }
-        .strength-meter.strong { background: var(--success); width: 100%; }
+        /* ===== Alerts ===== */
+        .cw-alert {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.65rem;
+            padding: 0.85rem 1.1rem;
+            border-radius: 12px;
+            font-size: 0.86rem;
+            line-height: 1.5;
+            margin-bottom: 1.15rem;
+            border-left: 4px solid;
+            animation: cw-fade 0.2s ease;
+        }
+        .cw-alert i { margin-top: 2px; flex-shrink: 0; font-size: 1.05rem; }
+        .cw-alert-error { background: #fef2f2; color: #991b1b; border-color: var(--red); }
+        [data-bs-theme="dark"] .cw-alert-error { background: #450a0a; color: #fecaca; }
+        .cw-alert-success { background: #ecfdf5; color: #065f46; border-color: var(--green); }
+        [data-bs-theme="dark"] .cw-alert-success { background: #064e3b; color: #6ee7b7; }
 
-        /* Responsive */
-        @media (max-width: 860px) {
-            .card {
-                flex-direction: column;
-            }
-            .left {
-                padding: 2.5rem 2rem;
-            }
-            .right {
-                padding: 2.5rem 2rem;
-            }
-            .logo {
-                width: 100px;
-                height: 100px;
-            }
+        /* ===== Attempts notice ===== */
+        .cw-attempts {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.65rem 0.9rem;
+            border-radius: 10px;
+            background: #fef3c7;
+            color: #92400e;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin-bottom: 1.15rem;
+            border-left: 4px solid var(--amber);
+        }
+        [data-bs-theme="dark"] .cw-attempts {
+            background: #78350f;
+            color: #fcd34d;
+        }
+        .cw-attempts i { font-size: 1rem; }
+
+        @media(max-width:1024px){
+            .sidebar{transform:translateX(-100%)}
+            .sidebar.open{transform:translateX(0)}
+            .main-content{margin-left:0}
+            .menu-toggle{display:flex}
+        }
+        @media(max-width:640px){
+            .main-content{padding:1rem}
+            .cw-card-body { padding: 1.15rem; }
+            .cw-card-head { padding: 1rem 1.15rem; }
         }
     </style>
 </head>
 <body>
 
-<!-- Theme Toggle -->
-<button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
-    <i class="fas fa-moon"></i>
-</button>
+<!-- ===== Sidebar ===== -->
+<aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
+    <nav class="sidebar-nav">
+        <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
+        <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
+        <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
+        <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
+        <a href="change_user_password.php" class="active"><i class="bi bi-key"></i> Change Password</a>
+    </nav>
+    <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
+</aside>
 
-<div class="container">
-    <div class="card">
-        <!-- Left Side -->
-        <div class="left">
-            <img src="../assets/img/usat.jpg" alt="USAT College Seal" class="logo"
-                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22140%22 height=%22140%22><rect fill=%22%234a90d9%22 width=%22140%22 height=%22140%22 rx=%2270%22/><text fill=%22white%22 font-size=%2250%22 x=%2250%25%22 y=%2255%25%22 text-anchor=%22middle%22 dy=%22.3em%22>USAT</text></svg>'">
-            <h1>Password Reset</h1>
-            <p style="position:relative;z-index:1;opacity:0.9;">Admin Tool</p>
-            
-            <div class="admin-info">
-                <i class="fas fa-user-shield"></i>
-                <span>Logged in as: <strong><?= $admin_name ?></strong></span>
+<!-- ===== Main ===== -->
+<div class="main-content" id="mainContent">
+
+    <!-- Topbar -->
+    <div class="topbar">
+        <div class="d-flex align-items-center gap-3">
+            <button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button>
+            <div>
+                <div class="breadcrumb-nav">
+                    <a href="create_account.php">Accounts</a>
+                    <i class="bi bi-chevron-right small"></i>
+                    Change Password
+                </div>
+                <h2 style="font-size:1.4rem;font-weight:700;margin:0">Change User Password</h2>
+                <p class="text-muted small mb-0">Reset another admin's password</p>
             </div>
         </div>
+        <div class="d-flex gap-2 align-items-center">
+            <a href="create_account.php" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i> Back</a>
+            <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+        </div>
+    </div>
 
-        <!-- Right Side -->
-        <div class="right">
-            <h2>Change User Password</h2>
-            <p class="subtitle">Enter the username and new password below</p>
+    <div class="cw-wrap">
 
-            <?php if ($error): ?>
-                <div class="error" role="alert">
-                    <i class="fas fa-exclamation-circle"></i>
-                    <span><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></span>
+        <!-- Alerts -->
+        <?php if ($error): ?>
+            <div class="cw-alert cw-alert-error" role="alert">
+                <i class="bi bi-exclamation-circle-fill"></i>
+                <span><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></span>
+            </div>
+        <?php endif; ?>
+        <?php if ($success): ?>
+            <div class="cw-alert cw-alert-success" role="status">
+                <i class="bi bi-check-circle-fill"></i>
+                <span><?= $success ?></span>
+            </div>
+        <?php endif; ?>
+
+        <?php if ($attempts_used > 0 && $locked_until === 0): ?>
+            <div class="cw-attempts">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <span><?= $attempts_left ?> attempt<?= $attempts_left === 1 ? '' : 's' ?> remaining before lockout.</span>
+            </div>
+        <?php endif; ?>
+
+        <!-- Form card -->
+        <div class="cw-card">
+            <div class="cw-card-head">
+                <div class="cw-card-head-icon"><i class="bi bi-key-fill"></i></div>
+                <div>
+                    <h3>Reset Password</h3>
+                    <p>Enter the target username and set a new password.</p>
                 </div>
-            <?php endif; ?>
+            </div>
 
-            <?php if ($success): ?>
-                <div class="success" role="status">
-                    <i class="fas fa-check-circle"></i>
-                    <span><?= $success ?></span>
-                </div>
-            <?php endif; ?>
+            <div class="cw-card-body">
+                <form method="POST" id="passwordForm" autocomplete="off" novalidate>
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token, ENT_QUOTES, 'UTF-8') ?>">
 
-            <form method="POST" id="passwordForm" autocomplete="off" novalidate>
-                <!-- CSRF Token -->
-                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token, ENT_QUOTES, 'UTF-8') ?>">
-                
-                <!-- Target Username -->
-                <div class="form-group">
-                    <label for="username">Target Username</label>
-                    <div class="icon-wrapper">
-                        <i class="fas fa-user"></i>
-                        <input type="text" 
-                               id="username" 
-                               name="username" 
-                               placeholder="Enter username to change password for" 
-                               required 
-                               autofocus
-                               maxlength="50"
-                               autocomplete="off"
-                               value="<?= isset($_POST['username']) ? htmlspecialchars($_POST['username'], ENT_QUOTES, 'UTF-8') : '' ?>"
-                               aria-label="Target username">
+                    <div class="cw-field">
+                        <label for="username">Target Username</label>
+                        <div class="cw-input-wrap">
+                            <input type="text"
+                                   id="username"
+                                   name="username"
+                                   placeholder="Enter username"
+                                   required
+                                   autofocus
+                                   maxlength="50"
+                                   autocomplete="off"
+                                   value="<?= isset($_POST['username']) ? htmlspecialchars($_POST['username'], ENT_QUOTES, 'UTF-8') : '' ?>">
+                            <i class="bi bi-person cw-input-icon"></i>
+                        </div>
                     </div>
-                </div>
 
-                <!-- New Password -->
-                <div class="form-group">
-                    <label for="new_password">New Password</label>
-                    <div class="icon-wrapper">
-                        <i class="fas fa-lock"></i>
-                        <input type="password" 
-                               id="new_password" 
-                               name="new_password" 
-                               placeholder="Enter new password" 
-                               required 
-                               minlength="8"
-                               maxlength="128"
-                               autocomplete="new-password"
-                               aria-label="New password">
+                    <div class="cw-field">
+                        <div class="cw-field-head">
+                            <label for="new_password">New Password</label>
+                            <span class="cw-charcount" id="cwCharCount">0 / 128</span>
+                        </div>
+                        <div class="cw-input-wrap">
+                            <input type="password"
+                                   id="new_password"
+                                   name="new_password"
+                                   placeholder="Enter new password"
+                                   required
+                                   minlength="8"
+                                   maxlength="128"
+                                   autocomplete="new-password">
+                            <i class="bi bi-lock-fill cw-input-icon"></i>
+                            <button type="button" class="cw-eye" data-toggle-pw="new_password" aria-label="Show password">
+                                <i class="bi bi-eye"></i>
+                            </button>
+                        </div>
+                        <div class="cw-strength" id="cwStrength">
+                            <span class="cw-strength-seg"></span>
+                            <span class="cw-strength-seg"></span>
+                            <span class="cw-strength-seg"></span>
+                            <span class="cw-strength-seg"></span>
+                            <span class="cw-strength-seg"></span>
+                        </div>
+                        <div class="cw-reqs" id="cwReqs">
+                            <span class="cw-req" data-req="length"><i class="bi bi-circle-fill"></i> 8+ chars</span>
+                            <span class="cw-req" data-req="upper"><i class="bi bi-circle-fill"></i> A–Z</span>
+                            <span class="cw-req" data-req="lower"><i class="bi bi-circle-fill"></i> a–z</span>
+                            <span class="cw-req" data-req="num"><i class="bi bi-circle-fill"></i> 0–9</span>
+                            <span class="cw-req" data-req="special"><i class="bi bi-circle-fill"></i> !@#</span>
+                        </div>
                     </div>
-                    <div class="strength-meter" id="strengthMeter"></div>
-                </div>
 
-                <!-- Confirm Password -->
-                <div class="form-group">
-                    <label for="confirm_password">Confirm New Password</label>
-                    <div class="icon-wrapper">
-                        <i class="fas fa-lock"></i>
-                        <input type="password" 
-                               id="confirm_password" 
-                               name="confirm_password" 
-                               placeholder="Confirm new password" 
-                               required 
-                               minlength="8"
-                               maxlength="128"
-                               autocomplete="new-password"
-                               aria-label="Confirm new password">
+                    <div class="cw-field">
+                        <label for="confirm_password">Confirm New Password</label>
+                        <div class="cw-input-wrap">
+                            <input type="password"
+                                   id="confirm_password"
+                                   name="confirm_password"
+                                   placeholder="Re-enter new password"
+                                   required
+                                   minlength="8"
+                                   maxlength="128"
+                                   autocomplete="new-password">
+                            <i class="bi bi-lock-fill cw-input-icon"></i>
+                            <button type="button" class="cw-eye" data-toggle-pw="confirm_password" aria-label="Show password">
+                                <i class="bi bi-eye"></i>
+                            </button>
+                        </div>
                     </div>
-                </div>
 
-                <!-- Password Requirements -->
-                <div class="password-requirements">
-                    <strong><i class="fas fa-shield-alt"></i> Password Requirements:</strong>
-                    <ul>
-                        <li><i class="fas fa-check-circle" style="color:#10b981;"></i> At least 8 characters</li>
-                        <li><i class="fas fa-check-circle" style="color:#10b981;"></i> One uppercase letter (A-Z)</li>
-                        <li><i class="fas fa-check-circle" style="color:#10b981;"></i> One lowercase letter (a-z)</li>
-                        <li><i class="fas fa-check-circle" style="color:#10b981;"></i> One number (0-9)</li>
-                        <li><i class="fas fa-check-circle" style="color:#10b981;"></i> One special character (!@#$%^&*)</li>
-                    </ul>
-                </div>
-
-                <!-- Admin Password Verification -->
-                <div class="form-group">
-                    <label for="admin_password">Your Admin Password (Verification)</label>
-                    <div class="icon-wrapper">
-                        <i class="fas fa-key"></i>
-                        <input type="password" 
-                               id="admin_password" 
-                               name="admin_password" 
-                               placeholder="Enter your own password to confirm" 
-                               required
-                               autocomplete="current-password"
-                               aria-label="Your admin password for verification">
+                    <div class="cw-divider">
+                        <span><i class="bi bi-shield-check"></i> Verification</span>
                     </div>
-                </div>
 
-                <button type="submit" class="btn" id="submitBtn">
-                    <i class="fas fa-key"></i>
-                    <span>Change Password</span>
-                </button>
-            </form>
+                    <div class="cw-field">
+                        <label for="admin_password">Your Admin Password</label>
+                        <div class="cw-input-wrap">
+                            <input type="password"
+                                   id="admin_password"
+                                   name="admin_password"
+                                   placeholder="Enter your password to confirm"
+                                   required
+                                   autocomplete="current-password">
+                            <i class="bi bi-shield-lock-fill cw-input-icon"></i>
+                            <button type="button" class="cw-eye" data-toggle-pw="admin_password" aria-label="Show password">
+                                <i class="bi bi-eye"></i>
+                            </button>
+                        </div>
+                        <p class="cw-hint">Required as proof that you're the one making this change.</p>
+                    </div>
 
-            <div class="back-link">
-                <a href="dashboard.php">
-                    <i class="fas fa-arrow-left"></i>
-                    Back to Dashboard
-                </a>
+                    <button type="submit" class="cw-submit" id="cwSubmit" <?= $locked_until > 0 ? 'disabled' : '' ?>>
+                        <i class="bi <?= $locked_until > 0 ? 'bi-lock-fill' : 'bi-key-fill' ?>"></i>
+                        <span><?= $locked_until > 0 ? "Locked for {$locked_until} min" : 'Change Password' ?></span>
+                    </button>
+                </form>
             </div>
         </div>
     </div>
 </div>
 
-<script>
-// Theme Management
-(function() {
-    const html = document.documentElement;
-    const toggleBtn = document.getElementById('themeToggle');
-    const icon = toggleBtn.querySelector('i');
-    
-    const savedTheme = localStorage.getItem('admin_theme') || 'light';
-    html.setAttribute('data-theme', savedTheme);
-    updateIcon(savedTheme);
-    
-    toggleBtn.addEventListener('click', () => {
-        const current = html.getAttribute('data-theme') || 'light';
-        const newTheme = current === 'dark' ? 'light' : 'dark';
-        html.setAttribute('data-theme', newTheme);
-        localStorage.setItem('admin_theme', newTheme);
-        updateIcon(newTheme);
-    });
-    
-    function updateIcon(theme) {
-        icon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
-    }
-})();
+<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
 
-// Password Strength Meter
-(function() {
-    const passwordInput = document.getElementById('new_password');
-    const strengthMeter = document.getElementById('strengthMeter');
-    
-    passwordInput.addEventListener('input', () => {
-        const password = passwordInput.value;
-        let strength = 0;
-        
-        if (password.length >= 8) strength++;
-        if (/[A-Z]/.test(password)) strength++;
-        if (/[a-z]/.test(password)) strength++;
-        if (/[0-9]/.test(password)) strength++;
-        if (/[^A-Za-z0-9]/.test(password)) strength++;
-        
-        strengthMeter.className = 'strength-meter';
-        if (strength <= 2) {
-            strengthMeter.classList.add('weak');
-        } else if (strength <= 3) {
-            strengthMeter.classList.add('medium');
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// ===== Sidebar toggle =====
+const sb = document.getElementById('sidebar'), ov = document.getElementById('sidebarOverlay');
+document.getElementById('menuToggle').addEventListener('click', () => {
+    sb.classList.toggle('open');
+    ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
+});
+
+// ===== Theme toggle =====
+const tb = document.getElementById('themeToggle'), ti = document.getElementById('themeIcon'), h = document.documentElement;
+function st(t){
+    h.setAttribute('data-bs-theme', t);
+    ti.className = 'bi bi-' + (t === 'dark' ? 'sun-fill' : 'moon-stars-fill');
+    document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + 60*60*24*365;
+}
+(function(){
+    const m = document.cookie.match(/(?:^|; )admin_theme=([^;]+)/);
+    st(m ? decodeURIComponent(m[1]) : 'light');
+})();
+tb.addEventListener('click', () => st(h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'));
+
+// ===== Password visibility toggles =====
+document.querySelectorAll('[data-toggle-pw]').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const input = document.getElementById(btn.getAttribute('data-toggle-pw'));
+        if (!input) return;
+        const icon = btn.querySelector('i');
+        if (input.type === 'password') {
+            input.type = 'text';
+            if (icon) icon.className = 'bi bi-eye-slash';
         } else {
-            strengthMeter.classList.add('strong');
+            input.type = 'password';
+            if (icon) icon.className = 'bi bi-eye';
+        }
+    });
+});
+
+// ===== Strength meter + requirement pills + char counter =====
+(function() {
+    const input = document.getElementById('new_password');
+    const segs  = document.querySelectorAll('#cwStrength .cw-strength-seg');
+    const reqs  = document.getElementById('cwReqs');
+    const count = document.getElementById('cwCharCount');
+    if (!input || !segs.length || !reqs) return;
+
+    const rules = {
+        length:  p => p.length >= 8,
+        upper:   p => /[A-Z]/.test(p),
+        lower:   p => /[a-z]/.test(p),
+        num:     p => /[0-9]/.test(p),
+        special: p => /[^A-Za-z0-9]/.test(p),
+    };
+
+    input.addEventListener('input', () => {
+        const p = input.value;
+        let met = 0;
+
+        for (const [key, test] of Object.entries(rules)) {
+            const pill = reqs.querySelector('[data-req="' + key + '"]');
+            if (!pill) continue;
+            const ok = test(p);
+            pill.classList.toggle('met', ok);
+            if (ok) met++;
+        }
+
+        const level = met <= 2 ? 'active-weak'
+                    : met <= 3 ? 'active-medium'
+                    : 'active-strong';
+        segs.forEach((seg, i) => {
+            seg.className = 'cw-strength-seg';
+            if (i < met) seg.classList.add(level);
+        });
+
+        if (count) {
+            const n = p.length;
+            count.textContent = n + ' / 128';
+            count.style.color = n > 128 ? 'var(--red)' : (n >= 8 ? 'var(--green)' : 'var(--text2)');
         }
     });
 })();
 
-// Form submission
+// ===== Form submit =====
 (function() {
     const form = document.getElementById('passwordForm');
-    const submitBtn = document.getElementById('submitBtn');
-    const btnText = submitBtn.querySelector('span');
-    const btnIcon = submitBtn.querySelector('i');
-    
+    const btn  = document.getElementById('cwSubmit');
+    if (!form || !btn) return;
+    const btnText = btn.querySelector('span');
+    const btnIcon = btn.querySelector('i');
+
     form.addEventListener('submit', function(e) {
-        const newPass = document.getElementById('new_password').value;
-        const confirmPass = document.getElementById('confirm_password').value;
-        const adminPass = document.getElementById('admin_password').value;
-        
-        // Client-side validation
-        if (!newPass || !confirmPass || !adminPass) {
-            e.preventDefault();
-            return;
-        }
-        
-        if (newPass !== confirmPass) {
-            e.preventDefault();
-            alert('New passwords do not match!');
-            return;
-        }
-        
-        if (newPass.length < 8) {
-            e.preventDefault();
-            alert('Password must be at least 8 characters!');
-            return;
-        }
-        
-        // Disable button and show loading
-        submitBtn.disabled = true;
-        btnIcon.className = 'fas fa-spinner fa-spin';
-        btnText.textContent = 'Updating...';
-        
-        // Re-enable after 30 seconds if stuck
-        setTimeout(() => {
-            if (submitBtn.disabled) {
-                submitBtn.disabled = false;
-                btnIcon.className = 'fas fa-key';
-                btnText.textContent = 'Change Password';
-            }
-        }, 30000);
+        const np = document.getElementById('new_password').value;
+        const cp = document.getElementById('confirm_password').value;
+        const ap = document.getElementById('admin_password').value;
+        const un = document.getElementById('username').value.trim();
+
+        if (!un || !np || !cp || !ap) { e.preventDefault(); return; }
+        if (np !== cp) { e.preventDefault(); alert('New passwords do not match.'); return; }
+        if (np.length < 8) { e.preventDefault(); alert('Password must be at least 8 characters.'); return; }
+
+        btn.disabled = true;
+        if (btnIcon) btnIcon.className = 'spinner-border spinner-border-sm';
+        if (btnText) btnText.textContent = 'Updating...';
     });
 })();
-
-// Prevent form resubmission
-if (window.history.replaceState) {
-    window.history.replaceState(null, null, window.location.href);
-}
 </script>
-
 </body>
 </html>

@@ -9,6 +9,34 @@ if (!isset($_SESSION['admin_id'])) {
 
 $current_page = basename($_SERVER['PHP_SELF']);
 
+/**
+ * Compute initials for a strand name.
+ *   "ICT Support and Computer Programming Technologies" → "ISCPT"
+ *   "Hospitality and Tourism"                          → "HT"
+ */
+function strandInitials(string $strand): string {
+    $stopwords = ['and','of','the','for','in','on','to','a','an','at','by','with','or'];
+    $words = preg_split('/\s+/', trim($strand));
+    $out = '';
+    foreach ($words as $w) {
+        $w = preg_replace('/[^A-Za-z0-9]/', '', $w);
+        if ($w === '') continue;
+        if (in_array(strtolower($w), $stopwords, true)) continue;
+        $out .= strtoupper($w[0]);
+    }
+    return $out !== '' ? $out : 'GEN';
+}
+
+/**
+ * Build display name: LastName, FirstName M.I. Ext.
+ * Example: "Pable, Joshua A."  or  "Pable, Joshua A. Jr."
+ */
+function formatStudentName(array $s): string {
+    $mi  = !empty($s['middle_name']) ? ' ' . strtoupper(substr(trim($s['middle_name']), 0, 1)) . '.' : '';
+    $ext = !empty($s['ext_name'])    ? ' ' . trim($s['ext_name']) : '';
+    return trim(($s['last_name'] ?? '') . ', ' . ($s['first_name'] ?? '') . $mi . $ext);
+}
+
 // ────────────────────────────────────────────────
 // UPDATE SCHOOL YEAR AFTER PROMOTION
 // ────────────────────────────────────────────────
@@ -45,7 +73,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_school_year'])
 }
 
 // ────────────────────────────────────────────────
-// PROMOTE SELECTED STUDENTS (with school year update)
+// PROMOTE SELECTED STUDENTS
 // ────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['promote_selected'])) {
     $selected_ids = $_POST['selected_students'] ?? [];
@@ -81,7 +109,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['promote_selected'])) 
                         if ($upd->affected_rows > 0) $promoted_11++;
                         $upd->close();
                     } elseif ($result['grade_level'] === 'Grade 12') {
-                        $upd = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', grade_level = 'Graduated', school_year = ? WHERE student_id = ? AND school_year = ?");
+                        // Graduate: keep grade_level = 'Grade 12' so grade snapshots stay correct
+                        $upd = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', school_year = ? WHERE student_id = ? AND school_year = ? AND grade_level = 'Grade 12'");
                         $upd->bind_param("sis", $new_school_year, $sid, $promote_sy);
                         $upd->execute();
                         if ($upd->affected_rows > 0) $graduated_12++;
@@ -111,7 +140,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['promote_selected'])) 
 }
 
 // ────────────────────────────────────────────────
-// PROMOTE ALL STUDENTS (with school year update)
+// PROMOTE ALL STUDENTS
 // ────────────────────────────────────────────────
 if (isset($_GET['promote_students']) && isset($_GET['school_year']) && isset($_GET['promote_type'])) {
     $promote_sy = trim($_GET['school_year']);
@@ -135,7 +164,8 @@ if (isset($_GET['promote_students']) && isset($_GET['school_year']) && isset($_G
                 $stmt->close();
                 $_SESSION['success'] = $total_promoted > 0 ? "$total_promoted student(s) promoted from Grade 11 to Grade 12. School year updated to $new_school_year." : "No active Grade 11 students found.";
             } elseif ($promote_type === 'grade12') {
-                $stmt = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', grade_level = 'Graduated', school_year = ? WHERE grade_level = 'Grade 12' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
+                // Graduate: keep grade_level = 'Grade 12'
+                $stmt = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', school_year = ? WHERE grade_level = 'Grade 12' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
                 $stmt->bind_param("ss", $new_school_year, $promote_sy);
                 $stmt->execute();
                 $total_promoted = $stmt->affected_rows;
@@ -144,7 +174,7 @@ if (isset($_GET['promote_students']) && isset($_GET['school_year']) && isset($_G
             } elseif ($promote_type === 'both') {
                 $stmt = $conn->prepare("UPDATE enrollment_form SET grade_level = 'Grade 12', school_year = ? WHERE grade_level = 'Grade 11' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
                 $stmt->bind_param("ss", $new_school_year, $promote_sy); $stmt->execute(); $p11 = $stmt->affected_rows; $stmt->close();
-                $stmt = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', grade_level = 'Graduated', school_year = ? WHERE grade_level = 'Grade 12' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
+                $stmt = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', school_year = ? WHERE grade_level = 'Grade 12' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
                 $stmt->bind_param("ss", $new_school_year, $promote_sy); $stmt->execute(); $p12 = $stmt->affected_rows; $stmt->close();
                 $total_promoted = $p11 + $p12;
                 $msg = [];
@@ -179,60 +209,151 @@ $per_page = 50;
 $offset = ($page - 1) * $per_page;
 
 // ────────────────────────────────────────────────
-// AUTO SECTION ASSIGNMENT
+// AUTO SECTION ASSIGNMENT — initials + letter
 // ────────────────────────────────────────────────
 if (isset($_GET['auto_assign'])) {
     if (empty($grade_level) || empty($school_year)) {
         $_SESSION['error'] = "Please select Grade Level and School Year to auto-assign sections.";
     } else {
-        $stmt = $conn->prepare("SELECT DISTINCT strand, program FROM enrollment_form WHERE grade_level = ? AND school_year = ?");
+        $target_size      = max(5, min(60, (int)($_GET['section_size'] ?? 35)));
+        $replace_existing = !empty($_GET['replace_sections']);
+        $max_sections     = 26;
+
+        $stmt = $conn->prepare("
+            SELECT e.enrollment_id, e.strand, e.program, e.section,
+                   s.last_name, s.first_name, s.sex
+            FROM enrollment_form e
+            INNER JOIN students_info s ON e.student_id = s.student_id
+            WHERE e.grade_level = ?
+              AND e.school_year = ?
+              AND COALESCE(e.status, 'Active') = 'Active'
+            ORDER BY e.strand ASC, s.last_name ASC, s.first_name ASC
+        ");
         $stmt->bind_param("ss", $grade_level, $school_year);
         $stmt->execute();
-        $groups = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $all_rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
         $stmt->close();
 
-        foreach ($groups as $group) {
-            $strand  = $group['strand'];
-            $program = $group['program'];
-            $sql = "SELECT e.enrollment_id, s.last_name, s.first_name FROM enrollment_form e INNER JOIN students_info s ON e.student_id = s.student_id WHERE e.grade_level = ? AND e.school_year = ?";
-            $params = [$grade_level, $school_year]; $types = "ss";
-            if ($strand !== null && $strand !== '') { $sql .= " AND e.strand = ?"; $types .= "s"; $params[] = $strand; }
-            else { $sql .= " AND (e.strand IS NULL OR e.strand = '')"; }
-            if ($program !== null && $program !== '') { $sql .= " AND e.program = ?"; $types .= "s"; $params[] = $program; }
-            else { $sql .= " AND (e.program IS NULL OR e.program = '')"; }
-            $sql .= " ORDER BY s.last_name ASC, s.first_name ASC";
-            $stmt = $conn->prepare($sql);
-            if (!empty($params)) $stmt->bind_param($types, ...$params);
-            $stmt->execute();
-            $students_group = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-            $stmt->close();
+        if (empty($all_rows)) {
+            $_SESSION['info'] = "No active students found for Grade $grade_level - SY $school_year.";
+        } else {
+            $groups           = [];
+            $skipped_groups   = [];
+            $skipped_students = 0;
 
-            $num_students = count($students_group);
-            if ($num_students > 0) {
-                $num_sections = ceil($num_students / 35);
-                $section_letters = range('A', chr(64 + min($num_sections, 26)));
-                $student_index = 0;
-                for ($sec = 0; $sec < $num_sections; $sec++) {
-                    $base_name = trim(($strand ? $strand : '') . ' ' . ($program ? $program : ''));
-                    $section_name = $base_name ? $base_name . ' ' . $section_letters[$sec] : 'General ' . $section_letters[$sec];
-                    for ($i = 0; $i < 35 && $student_index < $num_students; $i++, $student_index++) {
-                        $upd = $conn->prepare("UPDATE enrollment_form SET section = ? WHERE enrollment_id = ?");
-                        $upd->bind_param("si", $section_name, $students_group[$student_index]['enrollment_id']);
-                        $upd->execute(); $upd->close();
+            foreach ($all_rows as $r) {
+                $strand = trim((string)($r['strand'] ?? ''));
+                if ($strand === '') $strand = trim((string)($r['program'] ?? ''));
+                if ($strand === '') $strand = 'General';
+                $groups[$strand][] = $r;
+            }
+
+            if (!$replace_existing) {
+                foreach ($groups as $strand => $rows_in_group) {
+                    $has_existing = false;
+                    foreach ($rows_in_group as $r) {
+                        if (!empty($r['section'])) { $has_existing = true; break; }
+                    }
+                    if ($has_existing) {
+                        $skipped_groups[] = $strand;
+                        $skipped_students += count($rows_in_group);
+                        unset($groups[$strand]);
+                    }
+                }
+            }
+
+            if (empty($groups)) {
+                $_SESSION['info'] = "Nothing to assign — every strand in $grade_level / $school_year already has sections. Use Replace mode to force a full reassignment.";
+            } else {
+                $upd = $conn->prepare("UPDATE enrollment_form SET section = ? WHERE enrollment_id = ?");
+                if (!$upd) {
+                    $_SESSION['error'] = "Prepare failed: " . $conn->error;
+                } else {
+                    $total_assigned = 0;
+                    $total_sections = 0;
+                    $capped_groups  = [];
+
+                    $conn->begin_transaction();
+                    try {
+                        foreach ($groups as $strand => $students) {
+                            $base = strandInitials($strand);
+                            if ($base === '') $base = 'GEN';
+
+                            $males = []; $females = [];
+                            foreach ($students as $s) {
+                                $sx = strtoupper(trim($s['sex'] ?? ''));
+                                if ($sx === 'M' || $sx === 'MALE') $males[] = $s;
+                                else $females[] = $s;
+                            }
+
+                            $ordered = [];
+                            $mi = 0; $fi = 0;
+                            $n_m = count($males); $n_f = count($females);
+                            $n_total = $n_m + $n_f;
+                            for ($i = 0; $i < $n_total; $i++) {
+                                $pick_male = false;
+                                if ($mi < $n_m && $fi < $n_f) {
+                                    $pick_male = ($mi * $n_f) <= ($fi * $n_m);
+                                } elseif ($mi < $n_m) {
+                                    $pick_male = true;
+                                }
+                                $ordered[] = $pick_male ? $males[$mi++] : $females[$fi++];
+                            }
+
+                            $n = count($ordered);
+                            $num_sections = (int)ceil($n / $target_size);
+                            if ($num_sections < 1) $num_sections = 1;
+
+                            if ($num_sections > $max_sections) {
+                                $capped_groups[] = $base . " (needed $num_sections, capped at $max_sections)";
+                                $num_sections = $max_sections;
+                            }
+
+                            $per_section = (int)ceil($n / $num_sections);
+
+                            $idx = 0;
+                            for ($sec = 0; $sec < $num_sections; $sec++) {
+                                $letter = chr(65 + $sec);
+                                $section_name = $base . ' ' . $letter;
+
+                                for ($i = 0; $i < $per_section && $idx < $n; $i++, $idx++) {
+                                    $upd->bind_param("si", $section_name, $ordered[$idx]['enrollment_id']);
+                                    if (!$upd->execute()) {
+                                        throw new Exception("Failed to update section: " . $upd->error);
+                                    }
+                                    $total_assigned++;
+                                }
+                                $total_sections++;
+                            }
+                        }
+                        $upd->close();
+                        $conn->commit();
+
+                        $msg = "Auto-section complete: $total_assigned student(s) assigned to $total_sections section(s) for $grade_level - SY $school_year.";
+                        if ($skipped_students > 0) {
+                            $msg .= " Skipped " . count($skipped_groups) . " strand(s) (" . $skipped_students . " student(s)) that already had sections.";
+                        }
+                        if (!empty($capped_groups)) {
+                            $msg .= " Capped at $max_sections sections for: " . implode(', ', $capped_groups) . ".";
+                        }
+                        $_SESSION['success'] = $msg;
+                    } catch (Exception $e) {
+                        $conn->rollback();
+                        $upd->close();
+                        $_SESSION['error'] = "Auto-section failed: " . $e->getMessage();
                     }
                 }
             }
         }
-        $_SESSION['success'] = "Sections auto-assigned for Grade $grade_level - School Year $school_year.";
     }
     header("Location: student_profile.php?grade_level=" . urlencode($grade_level) . "&school_year=" . urlencode($school_year));
     exit();
 }
 
 // ────────────────────────────────────────────────
-// MAIN STUDENTS QUERY (OPTIMIZED WITH COUNT OVER + PAGINATION)
+// MAIN STUDENTS QUERY — uses e.term now
 // ────────────────────────────────────────────────
-$sql = "SELECT s.student_id, s.student_id_number, s.lrn, s.last_name, s.first_name, s.middle_name, s.ext_name, s.sex, s.age, e.grade_level, e.school_year, e.section, e.strand, e.track, e.program, e.semester, COALESCE(e.status, 'Active') AS status, COUNT(*) OVER() as total_count FROM students_info s INNER JOIN enrollment_form e ON s.student_id = e.student_id WHERE 1=1";
+$sql = "SELECT s.student_id, s.student_id_number, s.lrn, s.last_name, s.first_name, s.middle_name, s.ext_name, s.sex, s.age, e.grade_level, e.school_year, e.section, e.strand, e.track, e.program, e.term, COALESCE(e.status, 'Active') AS status, COUNT(*) OVER() as total_count FROM students_info s INNER JOIN enrollment_form e ON s.student_id = e.student_id WHERE 1=1";
 
 $params = []; $types = "";
 if ($search !== '') { $sql .= " AND (s.first_name LIKE ? OR s.last_name LIKE ? OR s.lrn LIKE ? OR s.student_id_number LIKE ?)"; $like = "%$search%"; $params = [$like,$like,$like,$like]; $types = "ssss"; }
@@ -271,7 +392,7 @@ if ($status !== '' && $status !== 'All') { $ssql .= " AND COALESCE(e.status, 'Ac
 $ssql .= " GROUP BY e.section ORDER BY e.section ASC";
 $ss = $conn->prepare($ssql); if(!empty($sp)) $ss->bind_param($stt,...$sp); $ss->execute(); $all_sections = $ss->get_result()->fetch_all(MYSQLI_ASSOC); $ss->close();
 
-// Count for promote
+// Promote preview counts
 $promote_preview_11 = 0; $promote_preview_12 = 0;
 if ($school_year) {
     $ps = $conn->prepare("SELECT COUNT(*) as cnt FROM enrollment_form WHERE grade_level = 'Grade 11' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
@@ -291,7 +412,6 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
 $base_url = "?search=" . urlencode($search) . "&grade_level=" . urlencode($grade_level) . "&school_year=" . urlencode($school_year) . "&status=" . urlencode($status);
 if ($show_promote_mode) $base_url .= "&show_promotable=1";
 
-// Generate next school year suggestion
 $next_sy = '';
 $parts = explode('-', $school_year);
 if (count($parts) === 2) {
@@ -328,7 +448,7 @@ if (count($parts) === 2) {
         .student-card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);padding:1.25rem;transition:all 0.3s;display:flex;gap:1rem;align-items:flex-start;position:relative}.student-card:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg);border-color:var(--accent)}.student-card.selected{border-color:var(--amber);background:rgba(245,158,11,0.05);box-shadow:0 0 0 2px rgba(245,158,11,0.3)}.student-card .select-check{position:absolute;top:0.75rem;right:0.75rem;width:22px;height:22px;accent-color:var(--amber);cursor:pointer;z-index:2;transform:scale(1.3)}
         .student-avatar{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:1.2rem;flex-shrink:0}
         .student-info{flex:1;min-width:0}.student-info h4{font-size:0.95rem;font-weight:600;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:30px}.student-info .meta{font-size:0.75rem;color:var(--text2);margin-top:0.25rem}.student-info .tags{display:flex;gap:0.35rem;flex-wrap:wrap;margin-top:0.5rem}
-        .tag{display:inline-block;padding:0.15rem 0.5rem;border-radius:20px;font-size:0.68rem;font-weight:600;background:var(--bg);color:var(--text2)}.tag.accent{background:#eef2ff;color:#4338ca}[data-bs-theme="dark"] .tag.accent{background:#312e81;color:#a5b4fc}.tag.promotable{background:#fef3c7;color:#92400e}[data-bs-theme="dark"] .tag.promotable{background:#78350f;color:#fcd34d}
+        .tag{display:inline-block;padding:0.15rem 0.5rem;border-radius:20px;font-size:0.68rem;font-weight:600;background:var(--bg);color:var(--text2)}.tag.accent{background:#eef2ff;color:#4338ca}[data-bs-theme="dark"] .tag.accent{background:#312e81;color:#a5b4fc}.tag.promotable{background:#fef3c7;color:#92400e}[data-bs-theme="dark"] .tag.promotable{background:#78350f;color:#fcd34d}.tag.initials{background:#fce7f3;color:#9d174d;font-weight:700;letter-spacing:0.5px}[data-bs-theme="dark"] .tag.initials{background:#831843;color:#fbcfe8}
         .status-dot{display:inline-flex;align-items:center;gap:0.3rem;font-size:0.72rem;font-weight:600}.status-dot::before{content:'';width:7px;height:7px;border-radius:50%}.status-dot.success::before{background:var(--green)}.status-dot.warning::before{background:var(--amber)}.status-dot.danger::before{background:var(--red)}
         .promote-bar{background:linear-gradient(135deg,#fef3c7,#fde68a);border:2px solid #f59e0b;border-radius:var(--radius);padding:0.75rem 1.25rem;margin-bottom:1rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;position:sticky;top:0;z-index:50}[data-bs-theme="dark"] .promote-bar{background:linear-gradient(135deg,#78350f,#92400e);border-color:#f59e0b;color:#fef3c7}.promote-bar .selected-count{font-weight:700;font-size:1.1rem}
         .btn-promote{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;border:none;font-weight:600;white-space:nowrap}.btn-promote:hover{background:linear-gradient(135deg,#d97706,#b45309);color:#fff;transform:translateY(-1px);box-shadow:0 4px 12px rgba(217,119,6,0.3)}
@@ -360,10 +480,8 @@ if (count($parts) === 2) {
         <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
     </div>
 
-    <!-- Stats -->
     <div class="stat-grid"><div class="stat-card"><div class="stat-value"><?= number_format($total_students) ?></div><div class="stat-label">Total Students</div></div><div class="stat-card"><div class="stat-value"><?= number_format($boys) ?></div><div class="stat-label">Boys</div></div><div class="stat-card"><div class="stat-value"><?= number_format($girls) ?></div><div class="stat-label">Girls</div></div><div class="stat-card"><div class="stat-value"><?= count($all_sections) ?></div><div class="stat-label">Sections</div></div></div>
 
-    <!-- Filter -->
     <div class="card"><div class="card-header"><h3><i class="bi bi-funnel"></i> Filters</h3></div><div class="card-body">
         <form class="filter-bar" method="GET" id="filterForm">
             <input type="hidden" name="page" value="1">
@@ -391,12 +509,10 @@ if (count($parts) === 2) {
         <?php endif; ?>
     </div></div>
 
-    <!-- Sections -->
     <?php if(!empty($all_sections) && !$show_promote_mode): ?>
     <div class="card"><div class="card-header"><h3><i class="bi bi-diagram-3"></i> Sections (<?= count($all_sections) ?>)</h3></div><div class="card-body no-padding"><table class="table-admin"><thead><tr><th>Section</th><th class="text-center">Total</th><th class="text-center">Boys</th><th class="text-center">Girls</th><th class="text-center">Action</th></tr></thead><tbody><?php foreach($all_sections as $sec): ?><tr><td class="fw-bold"><?= htmlspecialchars($sec['section']) ?></td><td class="fw-semibold text-center"><?= $sec['total'] ?></td><td class="text-center" style="color:var(--blue)"><?= $sec['boys']??0 ?></td><td class="text-center" style="color:var(--red)"><?= $sec['girls']??0 ?></td><td class="text-center"><a href="sections_list.php?section=<?= urlencode($sec['section']) ?>" class="btn btn-outline-primary btn-xs"><i class="bi bi-eye me-1"></i> View</a></td></tr><?php endforeach; ?></tbody></table></div></div>
     <?php endif; ?>
 
-    <!-- Student Cards -->
     <div class="card">
         <div class="card-header">
             <h3><i class="bi bi-people"></i> Students (<?= $total_students ?>)</h3>
@@ -418,11 +534,32 @@ if (count($parts) === 2) {
 
             <?php if($total_students > 0): ?>
             <div class="student-grid">
-                <?php foreach($all_students as $s): $name = htmlspecialchars($s['last_name'].', '.$s['first_name']); $initials = strtoupper(substr($s['first_name']??'',0,1).substr($s['last_name']??'',0,1)); $st = $s['status'] ?? 'Active'; $isPromotable = ($st === 'Active') && in_array($s['grade_level']??'', ['Grade 11', 'Grade 12']); ?>
+                <?php foreach($all_students as $s):
+                    $name = htmlspecialchars(formatStudentName($s));
+                    $initials = strtoupper(substr($s['first_name']??'',0,1).substr($s['last_name']??'',0,1));
+                    $st = $s['status'] ?? 'Active';
+                    $isPromotable = ($st === 'Active') && in_array($s['grade_level']??'', ['Grade 11', 'Grade 12']);
+                    $strand_txt = $s['strand'] ?? '';
+                    $strand_init = $strand_txt !== '' ? strandInitials($strand_txt) : '—';
+                ?>
                 <div class="student-card <?= $show_promote_mode && $isPromotable ? 'promotable-card' : '' ?>" data-student-id="<?= $s['student_id'] ?>" data-promotable="<?= $isPromotable ? '1' : '0' ?>">
                     <?php if ($show_promote_mode && $isPromotable): ?><input type="checkbox" class="select-check student-checkbox" value="<?= $s['student_id'] ?>" onchange="updateSelection()"><?php endif; ?>
                     <div class="student-avatar"><?= $initials ?></div>
-                    <div class="student-info"><h4><?= $name ?></h4><div class="meta">LRN: <?= htmlspecialchars($s['lrn']??'—') ?> · ID: <?= htmlspecialchars($s['student_id_number']??'—') ?></div><div class="tags"><span class="tag accent"><?= htmlspecialchars($s['grade_level']??'—') ?></span><span class="tag"><?= htmlspecialchars($s['section']??'No Section') ?></span><span class="tag"><?= htmlspecialchars($s['strand']??'—') ?></span><?php if ($show_promote_mode && $isPromotable): ?><span class="tag promotable"><i class="bi bi-arrow-up-circle"></i> <?= $s['grade_level']=='Grade 11'?'→ 12':'→ Grad' ?></span><?php endif; ?><span class="status-dot <?= $st=='Active'?'success':($st=='Dropped'||$st=='Graduated'?'danger':'warning') ?>"><?= $st ?></span></div><div class="mt-2"><a href="view_student.php?id=<?= $s['student_id'] ?>" class="btn btn-outline-primary btn-xs"><i class="bi bi-eye me-1"></i> View Profile</a></div></div>
+                    <div class="student-info">
+                        <h4><?= $name ?></h4>
+                        <div class="meta">LRN: <?= htmlspecialchars($s['lrn']??'—') ?> · ID: <?= htmlspecialchars($s['student_id_number']??'—') ?></div>
+                        <div class="tags">
+                            <span class="tag accent"><?= htmlspecialchars($s['grade_level']??'—') ?></span>
+                            <span class="tag"><?= htmlspecialchars($s['section']??'No Section') ?></span>
+                            <span class="tag" title="<?= htmlspecialchars($strand_txt ?: '—') ?>"><?= htmlspecialchars($strand_txt ?: '—') ?></span>
+                            <?php if ($strand_init !== '—'): ?>
+                                <span class="tag initials" title="Strand initials"><?= htmlspecialchars($strand_init) ?></span>
+                            <?php endif; ?>
+                            <?php if ($show_promote_mode && $isPromotable): ?><span class="tag promotable"><i class="bi bi-arrow-up-circle"></i> <?= $s['grade_level']=='Grade 11'?'→ 12':'→ Grad' ?></span><?php endif; ?>
+                            <span class="status-dot <?= $st=='Active'?'success':($st=='Dropped'||$st=='Graduated'?'danger':'warning') ?>"><?= $st ?></span>
+                        </div>
+                        <div class="mt-2"><a href="view_student.php?id=<?= $s['student_id'] ?>" class="btn btn-outline-primary btn-xs"><i class="bi bi-eye me-1"></i> View Profile</a></div>
+                    </div>
                 </div>
                 <?php endforeach; ?>
             </div>
@@ -432,7 +569,6 @@ if (count($parts) === 2) {
     </div>
 </div>
 
-<!-- Promote Confirmation Modal -->
 <div class="modal fade" id="promoteConfirmModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header" style="background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff"><h6 class="modal-title fw-bold"><i class="bi bi-rocket-takeoff me-2"></i>Promote Students</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="promoteActionType"><div class="mb-3"><label class="form-label fw-semibold small">Current School Year</label><input type="text" class="form-control bg-light" id="currentSY" readonly></div><div class="mb-3"><label class="form-label fw-semibold small">New School Year <span class="text-danger">*</span></label><input type="text" class="form-control" id="newSY" placeholder="e.g., 2026-2027" required><div class="form-text">Suggested: <strong id="suggestedSY"></strong></div></div><div class="mb-3"><label class="form-label fw-semibold small">Promotion Details</label><div id="promoteDetails" class="small text-muted"></div></div><div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle me-1"></i> This will promote students AND update their school year.</div></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-promote btn-sm" id="confirmPromoteBtn"><i class="bi bi-rocket-takeoff me-1"></i> Promote & Update</button></div></div></div></div>
 
 <div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
@@ -445,11 +581,9 @@ const tb=document.getElementById('themeToggle'),ti=document.getElementById('them
 function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
 (function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
 
-// Show promote modal
 function showPromoteModal(type){const sy='<?= addslashes($school_year) ?>',g11=<?= $promote_preview_11 ?>,g12=<?= $promote_preview_12 ?>;document.getElementById('currentSY').value=sy;document.getElementById('promoteActionType').value=type;const p=sy.split('-');if(p.length===2){const ns=(parseInt(p[0])+1)+'-'+(parseInt(p[1])+1);document.getElementById('suggestedSY').textContent=ns;document.getElementById('newSY').value=ns}let d='';if(type==='grade11')d=`<strong>${g11}</strong> Grade 11 → Grade 12`;else if(type==='grade12')d=`<strong>${g12}</strong> Grade 12 → Graduated`;else{if(g11>0)d+=`<strong>${g11}</strong> Grade 11 → Grade 12<br>`;if(g12>0)d+=`<strong>${g12}</strong> Grade 12 → Graduated`}document.getElementById('promoteDetails').innerHTML=d;new bootstrap.Modal(document.getElementById('promoteConfirmModal')).show()}
 document.getElementById('confirmPromoteBtn').addEventListener('click',function(){const t=document.getElementById('promoteActionType').value,o=document.getElementById('currentSY').value,n=document.getElementById('newSY').value.trim();if(!n){alert('Please enter the new school year.');return}if(n===o){alert('New school year must be different.');return}window.location.href=`student_profile.php?promote_students=1&school_year=${encodeURIComponent(o)}&promote_type=${t}&new_school_year=${encodeURIComponent(n)}`});
 
-// Select to promote
 function updateSelection(){const c=document.querySelectorAll('.student-checkbox:checked'),n=c.length,b=document.getElementById('promoteBar'),t=document.getElementById('promoteSelectedBtn'),l=document.getElementById('selectedCount'),p=document.getElementById('selectedIdsContainer');if(b)b.style.display=n>0?'flex':'none';if(l)l.textContent=n;if(t)t.disabled=n===0;if(p){p.innerHTML='';c.forEach(cb=>{const i=document.createElement('input');i.type='hidden';i.name='selected_students[]';i.value=cb.value;p.appendChild(i)})}document.querySelectorAll('.student-checkbox').forEach(cb=>{const cd=cb.closest('.student-card');if(cd)cd.classList.toggle('selected',cb.checked)})}
 function selectAll(){document.querySelectorAll('.student-checkbox').forEach(cb=>{cb.checked=true});updateSelection()}
 function deselectAll(){document.querySelectorAll('.student-checkbox').forEach(cb=>{cb.checked=false});updateSelection()}

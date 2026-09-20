@@ -34,7 +34,7 @@ if (!empty($strand_filter)) {
 
 // ====================== KPI QUERIES (SEPARATE - RELIABLE) ======================
 // Total Students
-$ts_sql = "SELECT COUNT(DISTINCT student_id) as total FROM enrollment_form WHERE 1=1 $sy_filter";
+$ts_sql = "SELECT COUNT(DISTINCT e.student_id) as total FROM enrollment_form e WHERE 1=1 $sy_filter";
 $stmt = $conn->prepare($ts_sql);
 if (!empty($params_main)) $stmt->bind_param($types_main, ...$params_main);
 $stmt->execute(); 
@@ -42,7 +42,7 @@ $total_students = (int)($stmt->get_result()->fetch_assoc()['total'] ?? 0);
 $stmt->close();
 
 // Total Sections
-$tsec_sql = "SELECT COUNT(DISTINCT section) as total FROM enrollment_form WHERE section IS NOT NULL AND TRIM(section) != '' $sy_filter";
+$tsec_sql = "SELECT COUNT(DISTINCT e.section) as total FROM enrollment_form e WHERE e.section IS NOT NULL AND TRIM(e.section) != '' $sy_filter";
 $stmt = $conn->prepare($tsec_sql);
 if (!empty($params_main)) $stmt->bind_param($types_main, ...$params_main);
 $stmt->execute(); 
@@ -63,7 +63,7 @@ $boy_percent = $total_gender > 0 ? round(($boys / $total_gender) * 100, 1) : 0;
 $girl_percent = $total_gender > 0 ? round(($girls / $total_gender) * 100, 1) : 0;
 
 // Total Strands
-$tstr_sql = "SELECT COUNT(DISTINCT strand) as total FROM enrollment_form WHERE strand IS NOT NULL $sy_filter";
+$tstr_sql = "SELECT COUNT(DISTINCT e.strand) as total FROM enrollment_form e WHERE e.strand IS NOT NULL $sy_filter";
 $stmt = $conn->prepare($tstr_sql);
 if (!empty($params_main)) $stmt->bind_param($types_main, ...$params_main);
 $stmt->execute(); 

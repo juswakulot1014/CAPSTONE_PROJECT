@@ -197,7 +197,6 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
         <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
         <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
-        <a href="change_user_password.php"><i class="bi bi-key"></i> Change Password</a>
     </nav>
     <div class="sidebar-footer">
         <a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a>

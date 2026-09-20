@@ -52,7 +52,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_account'])) {
     if ($account_id == $_SESSION['admin_id']) {
         $_SESSION['error'] = "You cannot delete your own account!";
     } else {
-        // Prevent deleting the last superadmin
         $count_sa = $conn->query("SELECT COUNT(*) as cnt FROM admins WHERE role='superadmin'")->fetch_assoc()['cnt'];
         $target_role = $conn->query("SELECT role FROM admins WHERE id=$account_id")->fetch_assoc()['role'] ?? '';
         
@@ -102,7 +101,7 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
         }
         *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
         body{background:var(--bg);color:var(--text);min-height:100vh}
-        
+
         .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
         .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
         .sidebar-brand img{width:40px;height:40px;border-radius:10px}
@@ -112,37 +111,37 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
         .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
         .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
         .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
-        
+
         .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
         .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
         .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
-        
+
         .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem}
         .stat-card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);box-shadow:var(--shadow);padding:1rem 1.25rem;text-align:center;transition:all 0.3s}
         .stat-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--accent)}
         .stat-value{font-size:1.6rem;font-weight:700;color:var(--accent)}
         .stat-label{font-size:0.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-top:0.2rem}
-        
+
         .card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);margin-bottom:1.25rem;overflow:hidden}
         .card-header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
         .card-header h3{margin:0;font-size:0.95rem;font-weight:600;display:flex;align-items:center;gap:0.5rem}
         .card-header h3 i{color:var(--accent)}
         .card-body{padding:1.5rem}.card-body.no-padding{padding:0}
-        
+
         .table-admin{width:100%;border-collapse:collapse}
         .table-admin th{background:var(--bg);font-size:0.7rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;padding:0.75rem 1rem;text-align:left;border-bottom:2px solid var(--border)}
         .table-admin td{padding:0.75rem 1rem;border-bottom:1px solid var(--border);font-size:0.85rem;vertical-align:middle}
         .table-admin tr:hover td{background:rgba(79,70,229,0.03)}
         .table-admin tr:last-child td{border-bottom:none}
-        
+
         .badge-pill{display:inline-flex;align-items:center;gap:0.3rem;padding:0.25rem 0.7rem;border-radius:50px;font-size:0.72rem;font-weight:600}
         .badge-pill.danger{background:#fee2e2;color:#991b1b}[data-bs-theme="dark"] .badge-pill.danger{background:#7f1d1d;color:#fca5a5}
         .badge-pill.primary{background:#dbeafe;color:#1e40af}[data-bs-theme="dark"] .badge-pill.primary{background:#1e3a5f;color:#93c5fd}
-        
+
         .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center}
         .theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}
         .btn{font-weight:500;border-radius:8px}
-        
+
         @media(max-width:1024px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main-content{margin-left:0}.menu-toggle{display:flex}}
         @media(max-width:640px){.main-content{padding:1rem}.stat-grid{grid-template-columns:repeat(2,1fr)}}
     </style>
@@ -156,6 +155,7 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
         <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
         <a href="create_account.php" class="active"><i class="bi bi-person-plus"></i> Accounts</a>
+        <a href="change_user_password.php"><i class="bi bi-key"></i> Change Password</a>
     </nav>
     <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
 </aside>
@@ -173,19 +173,18 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
             </div>
         </div>
         <div class="d-flex gap-2 align-items-center">
+            <a href="change_user_password.php" class="btn btn-outline-primary btn-sm"><i class="bi bi-key me-1"></i> Change Password</a>
             <span class="badge-pill danger"><i class="bi bi-shield-lock"></i> Restricted Area</span>
             <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
         </div>
     </div>
 
-    <!-- Stats -->
     <div class="stat-grid">
         <div class="stat-card"><div class="stat-value"><?= $total_accounts ?></div><div class="stat-label">Total Accounts</div></div>
         <div class="stat-card"><div class="stat-value"><?= $superadmin_count ?></div><div class="stat-label">Super Admins</div></div>
         <div class="stat-card"><div class="stat-value"><?= $registrar_count ?></div><div class="stat-label">Registrars</div></div>
     </div>
 
-    <!-- Accounts Table -->
     <div class="card">
         <div class="card-header">
             <h3><i class="bi bi-people"></i> All Admin Accounts</h3>
@@ -262,12 +261,15 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-const sb=document.getElementById('sidebar'),ov=document.getElementById('sidebarOverlay');
-document.getElementById('menuToggle').addEventListener('click',()=>{sb.classList.toggle('open');ov.style.display=sb.classList.contains('open')?'block':'none'});
-const tb=document.getElementById('themeToggle'),ti=document.getElementById('themeIcon'),h=document.documentElement;
-function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
-(function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();
-tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
+const sb = document.getElementById('sidebar'), ov = document.getElementById('sidebarOverlay');
+document.getElementById('menuToggle').addEventListener('click', () => {
+    sb.classList.toggle('open');
+    ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
+});
+const tb = document.getElementById('themeToggle'), ti = document.getElementById('themeIcon'), h = document.documentElement;
+function st(t){ h.setAttribute('data-bs-theme', t); ti.className = 'bi bi-' + (t === 'dark' ? 'sun-fill' : 'moon-stars-fill'); document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + 60*60*24*365; }
+(function(){ const m = document.cookie.match(/admin_theme=([^;]+)/); st(m ? m[1] : 'light'); })();
+tb.addEventListener('click', () => st(h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'));
 
 function confirmDelete(id, name) {
     document.getElementById('deleteAccountId').value = id;

@@ -23,7 +23,6 @@ $where  = [];
 $params = [];
 $types  = "";
 
-// Single-student mode overrides everything else
 if ($student_id_filter > 0) {
     $where[]  = "s.student_id = ?";
     $params[] = $student_id_filter;
@@ -66,13 +65,13 @@ function fetchExportData(mysqli $conn, string $where_sql, array $params, string 
                a.purok_street, a.barangay, a.town_city, a.province,
                a.region, a.district, a.postal_code,
                e.enrollment_id, e.school_year, e.grade_level, e.track, e.strand, e.program,
-               e.section, e.semester, e.status, e.voucher_status, e.household_id
+               e.section, e.term, e.status, e.voucher_status, e.household_id
         FROM students_info s
         LEFT JOIN parents_info p ON s.student_id = p.student_id
         LEFT JOIN addresses   a ON s.student_id = a.student_id
         LEFT JOIN enrollment_form e ON s.student_id = e.student_id
         $where_sql
-        ORDER BY s.last_name ASC, s.first_name ASC, e.school_year DESC, e.semester ASC
+        ORDER BY s.last_name ASC, s.first_name ASC, e.school_year DESC, e.term ASC
     ";
     $stmt = $conn->prepare($sql);
     if (!empty($params)) $stmt->bind_param($types, ...$params);
@@ -141,7 +140,7 @@ function fetchExportData(mysqli $conn, string $where_sql, array $params, string 
                 'strand'        => $r['strand'],
                 'program'       => $r['program'],
                 'section'       => $r['section'],
-                'semester'      => $r['semester'],
+                'term'          => $r['term'],
                 'status'        => $r['status'],
                 'voucher_status'=> $r['voucher_status'],
                 'household_id'  => $r['household_id'],
@@ -153,14 +152,12 @@ function fetchExportData(mysqli $conn, string $where_sql, array $params, string 
         $ph = implode(',', array_fill(0, count($ids), '?'));
         $gsql = "
             SELECT sg.grade_id, sg.student_id, sg.enrollment_id,
-                   sg.semester, sg.quarter, sg.school_year, sg.subject_code,
-                   sg.subject_name, sg.grade, sg.remarks,
-                   e.school_year AS e_sy, e.grade_level AS e_gl
+                   sg.term, sg.grade_level, sg.school_year,
+                   sg.subject_code, sg.subject_name, sg.grade, sg.remarks
             FROM student_grades sg
-            LEFT JOIN enrollment_form e ON sg.enrollment_id = e.enrollment_id
             WHERE sg.student_id IN ($ph)
-            ORDER BY sg.student_id, e.school_year DESC, e.grade_level ASC,
-                     sg.semester ASC, sg.quarter ASC, sg.subject_name ASC
+            ORDER BY sg.student_id, sg.school_year DESC, sg.grade_level ASC,
+                     sg.term ASC, sg.subject_name ASC
         ";
         $gstmt = $conn->prepare($gsql);
         $gstmt->bind_param(str_repeat('i', count($ids)), ...$ids);
@@ -181,7 +178,6 @@ function nz($v) { return ($v === null || $v === '') ? '—' : $v; }
 // ====================== FETCH ======================
 $students = fetchExportData($conn, $where_sql, $params, $types);
 
-// Look up single-student display info
 $single_name = '';
 $single_id_number = '';
 if ($student_id_filter > 0 && !empty($students)) {
@@ -190,7 +186,6 @@ if ($student_id_filter > 0 && !empty($students)) {
     $single_id_number = $first['info']['student_id_number'] ?? '';
 }
 
-// Filter labels for headers
 $filter_desc = [];
 if ($student_id_filter > 0) {
     $filter_desc[] = "Single student: " . ($single_name !== '' ? $single_name : "ID $student_id_filter");
@@ -218,7 +213,7 @@ if ($format === 'csv') {
     if ($mode === 'grades') {
         fputcsv($out, [
             'Student ID Number','LRN','Last Name','First Name','Middle Name','Sex',
-            'School Year','Grade Level','Semester','Quarter',
+            'School Year','Grade Level','Term',
             'Subject Code','Subject Name','Grade','Remarks'
         ]);
         foreach ($students as $sid => $s) {
@@ -231,10 +226,9 @@ if ($format === 'csv') {
                     csvSafe($s['info']['first_name']),
                     csvSafe($s['info']['middle_name']),
                     csvSafe($s['info']['sex']),
-                    csvSafe($g['e_sy'] ?: $g['school_year']),
-                    csvSafe($g['e_gl']),
-                    csvSafe($g['semester']),
-                    csvSafe($g['quarter']),
+                    csvSafe($g['school_year']),
+                    csvSafe($g['grade_level']),
+                    csvSafe($g['term']),
                     csvSafe($g['subject_code']),
                     csvSafe($g['subject_name']),
                     $g['grade'] !== null ? number_format((float)$g['grade'], 2, '.', '') : '',
@@ -249,7 +243,7 @@ if ($format === 'csv') {
             'Address',
             'Father Name','Father Contact','Mother (Maiden)','Mother Contact',
             'Guardian','Guardian Contact','Family Income','4Ps','Household ID',
-            'School Year','Grade Level','Semester','Section','Track','Strand','Program',
+            'School Year','Grade Level','Term','Section','Track','Strand','Program',
             'Status','Voucher Status',
             'Grade Summary','GWA'
         ]);
@@ -299,7 +293,7 @@ if ($format === 'csv') {
                     csvSafe($info['mother_maiden_name']), csvSafe($info['mother_contact']),
                     csvSafe($info['guardian_fullname']), csvSafe($info['guardian_contact']),
                     csvSafe($info['ave_family_income']), csvSafe($info['is_4ps']), csvSafe($info['household_id']),
-                    csvSafe($en['school_year']), csvSafe($en['grade_level']), csvSafe($en['semester']),
+                    csvSafe($en['school_year']), csvSafe($en['grade_level']), csvSafe($en['term']),
                     csvSafe($en['section']), csvSafe($en['track']), csvSafe($en['strand']),
                     csvSafe($en['program']), csvSafe($en['status']), csvSafe($en['voucher_status']),
                     csvSafe($summary),
@@ -402,12 +396,12 @@ if ($format === 'word') {
 
         if (!empty($s['enrollments'])) {
             echo '<h3>Enrollment</h3><table>';
-            echo '<tr><th>School Year</th><th>Grade</th><th>Semester</th><th>Section</th><th>Track</th><th>Strand</th><th>Program</th><th>Status</th><th>Voucher</th></tr>';
+            echo '<tr><th>School Year</th><th>Grade</th><th>Term</th><th>Section</th><th>Track</th><th>Strand</th><th>Program</th><th>Status</th><th>Voucher</th></tr>';
             foreach ($s['enrollments'] as $en) {
                 echo '<tr>';
                 echo '<td>' . htmlspecialchars(nz($en['school_year'])) . '</td>';
                 echo '<td>' . htmlspecialchars(nz($en['grade_level'])) . '</td>';
-                echo '<td>' . htmlspecialchars(nz($en['semester'])) . '</td>';
+                echo '<td>' . htmlspecialchars(nz($en['term'])) . '</td>';
                 echo '<td>' . htmlspecialchars(nz($en['section'])) . '</td>';
                 echo '<td>' . htmlspecialchars(nz($en['track'])) . '</td>';
                 echo '<td>' . htmlspecialchars(nz($en['strand'])) . '</td>';
@@ -424,14 +418,13 @@ if ($format === 'word') {
             $gwa = calcGwa($s['grades']);
             if ($gwa !== null) echo '<p><span class="badge">Overall GWA: ' . number_format($gwa, 2) . '</span></p>';
             echo '<table class="grades">';
-            echo '<tr><th>School Year</th><th>Grade</th><th>Semester</th><th>Quarter</th><th>Code</th><th>Subject</th><th>Grade</th><th>Remarks</th></tr>';
+            echo '<tr><th>School Year</th><th>Grade</th><th>Term</th><th>Code</th><th>Subject</th><th>Grade</th><th>Remarks</th></tr>';
             foreach ($s['grades'] as $g) {
                 $gv = $g['grade'] !== null ? number_format((float)$g['grade'], 2) : '—';
                 echo '<tr>';
-                echo '<td>' . htmlspecialchars(nz($g['e_sy'] ?: $g['school_year'])) . '</td>';
-                echo '<td>' . htmlspecialchars(nz($g['e_gl'])) . '</td>';
-                echo '<td>' . htmlspecialchars(nz($g['semester'])) . '</td>';
-                echo '<td>' . htmlspecialchars(nz($g['quarter'])) . '</td>';
+                echo '<td>' . htmlspecialchars(nz($g['school_year'])) . '</td>';
+                echo '<td>' . htmlspecialchars(nz($g['grade_level'])) . '</td>';
+                echo '<td>' . htmlspecialchars(nz($g['term'])) . '</td>';
                 echo '<td>' . htmlspecialchars(nz($g['subject_code'])) . '</td>';
                 echo '<td>' . htmlspecialchars(nz($g['subject_name'])) . '</td>';
                 echo '<td style="text-align:center;font-weight:bold">' . $gv . '</td>';
@@ -559,7 +552,6 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     <?php endif; ?>
 
     <?php if ($student_id_filter <= 0): ?>
-    <!-- Filters (only for "all students" mode) -->
     <div class="card">
         <div class="card-header"><h3><i class="bi bi-funnel"></i> Filters (optional)</h3></div>
         <div class="card-body">
@@ -613,7 +605,6 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     </div>
     <?php endif; ?>
 
-    <!-- Export options -->
     <div class="card">
         <div class="card-header"><h3><i class="bi bi-download"></i> Choose Export Format</h3></div>
         <div class="card-body">

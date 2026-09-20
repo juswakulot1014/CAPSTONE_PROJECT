@@ -29,23 +29,20 @@ function normalizeGradeLevel($gl) {
     return null;
 }
 
-// Normalize semester to "1st Semester" / "2nd Semester" / null
-function normalizeSemester($sem) {
-    $s = strtolower(trim((string)$sem));
-    if ($s === '') return null;
-    if (strpos($s, '1') !== false || strpos($s, 'first') !== false) return '1st Semester';
-    if (strpos($s, '2') !== false || strpos($s, 'second') !== false) return '2nd Semester';
-    return null;
-}
-
-// Normalize quarter to "1st Quarter" / "2nd Quarter" / "3rd Quarter" / "4th Quarter" / null
-function normalizeQuarter($q) {
-    $q = strtolower(trim((string)$q));
-    if ($q === '') return null;
-    if (strpos($q, '1') !== false || strpos($q, 'first') !== false) return '1st Quarter';
-    if (strpos($q, '2') !== false || strpos($q, 'second') !== false) return '2nd Quarter';
-    if (strpos($q, '3') !== false || strpos($q, 'third') !== false) return '3rd Quarter';
-    if (strpos($q, '4') !== false || strpos($q, 'fourth') !== false) return '4th Quarter';
+/**
+ * Map a term to an SF10 semester block.
+ *   1st Term (Jun–Sep)  → 1st Semester
+ *   2nd Term (Sep–Dec)  → 2nd Semester
+ *   3rd Term (Jan–Apr)  → 2nd Semester (continued)
+ *
+ * Returns '1st Semester' | '2nd Semester' | null.
+ */
+function termToSemester($t) {
+    $t = strtolower(trim((string)$t));
+    if ($t === '') return null;
+    if (strpos($t, '1st') !== false || strpos($t, 'first') !== false) return '1st Semester';
+    if (strpos($t, '2nd') !== false || strpos($t, 'second') !== false) return '2nd Semester';
+    if (strpos($t, '3rd') !== false || strpos($t, 'third') !== false) return '2nd Semester';
     return null;
 }
 
@@ -87,11 +84,11 @@ if (!$student) {
 // ====================== FETCH ALL ENROLLMENTS ======================
 $enrollments = [];
 $en_stmt = $conn->prepare("
-    SELECT enrollment_id, school_year, grade_level, semester,
+    SELECT enrollment_id, school_year, grade_level, term,
            track, strand, program, section
     FROM enrollment_form
     WHERE student_id = ?
-    ORDER BY school_year ASC, semester ASC, enrollment_id ASC
+    ORDER BY school_year ASC, term ASC, enrollment_id ASC
 ");
 $en_stmt->bind_param("i", $student_id);
 $en_stmt->execute();
@@ -102,10 +99,11 @@ $en_stmt->close();
 // ====================== FETCH ALL GRADES ======================
 $grades_by_enrollment = [];
 $gr_stmt = $conn->prepare("
-    SELECT enrollment_id, semester, quarter, subject_code, subject_name, grade, remarks
+    SELECT enrollment_id, term, grade_level, school_year,
+           subject_code, subject_name, grade, remarks
     FROM student_grades
     WHERE student_id = ?
-    ORDER BY enrollment_id ASC, quarter ASC, subject_name ASC
+    ORDER BY enrollment_id ASC, FIELD(term, '1st Term', '2nd Term', '3rd Term'), subject_name ASC
 ");
 $gr_stmt->bind_param("i", $student_id);
 $gr_stmt->execute();
@@ -116,7 +114,7 @@ while ($row = $res->fetch_assoc()) {
 $gr_stmt->close();
 
 // ====================== BUILD SF10 STRUCTURE ======================
-// Canonical 4 blocks: G11-1st, G11-2nd, G12-1st, G12-2nd
+// Canonical 4 blocks: G11-1st Sem, G11-2nd Sem, G12-1st Sem, G12-2nd Sem
 $sf10 = [
     'Grade 11' => [
         '1st Semester' => ['enrollment' => null, 'subjects' => [], 'gwa' => null, 'school_year' => ''],
@@ -128,68 +126,107 @@ $sf10 = [
     ],
 ];
 
-// Map enrollments into structure
-foreach ($enrollments as $en_id => $en) {
-    $gl  = normalizeGradeLevel($en['grade_level']);
-    $sem = normalizeSemester($en['semester']);
-    if ($gl === null || $sem === null) continue; // skip non-G11/G12 rows
-
-    $sf10[$gl][$sem]['enrollment']   = $en;
-    $sf10[$gl][$sem]['school_year']  = $en['school_year'];
-
-    $rows = $grades_by_enrollment[$en_id] ?? [];
-
-    // Group by subject_code (fallback to subject_name)
-    $subjectMap = [];
+// Collect all grades first (independent of enrollment mapping), then
+// assign them to blocks by their own grade_level + term snapshots.
+// This is robust against enrollment_id mismatches after promotion.
+$allGrades = [];
+foreach ($grades_by_enrollment as $en_id => $rows) {
     foreach ($rows as $g) {
-        $key = !empty($g['subject_code']) ? $g['subject_code'] : ('__' . $g['subject_name']);
-        if (!isset($subjectMap[$key])) {
-            $subjectMap[$key] = [
-                'code'      => $g['subject_code'],
-                'name'      => $g['subject_name'],
-                'quarters'  => [],
-                'plain'     => null,
-                'remark'    => $g['remarks'] ?? null,
-            ];
+        // Prefer the snapshot on the grade row; fall back to the enrollment row's values
+        $gl  = normalizeGradeLevel($g['grade_level'] ?? '');
+        $sem = termToSemester($g['term'] ?? '');
+        if ($gl === null) {
+            // Fall back to the enrollment's grade level
+            $enRow = $enrollments[$en_id] ?? null;
+            if ($enRow) $gl = normalizeGradeLevel($enRow['grade_level'] ?? '');
         }
-        $q = normalizeQuarter($g['quarter'] ?? '');
-        if ($q !== null && $g['grade'] !== null && is_numeric($g['grade'])) {
-            $subjectMap[$key]['quarters'][$q] = (float)$g['grade'];
-        } elseif ($g['grade'] !== null && is_numeric($g['grade'])) {
-            $subjectMap[$key]['plain'] = (float)$g['grade'];
+        if ($sem === null) {
+            $enRow = $enrollments[$en_id] ?? null;
+            if ($enRow) $sem = termToSemester($enRow['term'] ?? '');
         }
-        if (!empty($g['remarks'])) $subjectMap[$key]['remark'] = $g['remarks'];
+        if ($gl === null || $sem === null) continue;
+
+        $allGrades[] = [
+            'grade_level' => $gl,
+            'semester'    => $sem,
+            'school_year' => $g['school_year'] ?? ($enrollments[$en_id]['school_year'] ?? ''),
+            'term'        => $g['term'] ?? '',
+            'code'        => $g['subject_code'],
+            'name'        => $g['subject_name'],
+            'grade'       => $g['grade'],
+            'remarks'     => $g['remarks'],
+        ];
     }
-
-    // Compute final grade per subject
-    $finalGrades = [];
-    foreach ($subjectMap as $key => &$subj) {
-        if (!empty($subj['quarters'])) {
-            $vals = array_values($subj['quarters']);
-            $subj['final'] = round(array_sum($vals) / count($vals), 2);
-        } elseif ($subj['plain'] !== null) {
-            $subj['final'] = $subj['plain'];
-        } else {
-            $subj['final'] = null;
-        }
-        if ($subj['final'] !== null) $finalGrades[] = $subj['final'];
-    }
-    unset($subj);
-
-    // Sort subjects alphabetically by code
-    uasort($subjectMap, function($a, $b) {
-        return strcasecmp($a['code'] ?: $a['name'], $b['code'] ?: $b['name']);
-    });
-
-    $sf10[$gl][$sem]['subjects'] = $subjectMap;
-    $sf10[$gl][$sem]['gwa'] = count($finalGrades) > 0
-        ? round(array_sum($finalGrades) / count($finalGrades), 2)
-        : null;
 }
 
-// Overall GWA (across all 4 blocks)
+// Also record which enrollment feeds each block (for school_year display)
+foreach ($enrollments as $en_id => $en) {
+    $gl  = normalizeGradeLevel($en['grade_level'] ?? '');
+    $sem = termToSemester($en['term'] ?? '');
+    if ($gl === null || $sem === null) continue;
+    $sf10[$gl][$sem]['enrollment']  = $en;
+    $sf10[$gl][$sem]['school_year'] = $en['school_year'];
+}
+
+// Group the grades into subjects per block
+foreach ($allGrades as $g) {
+    $block = &$sf10[$g['grade_level']][$g['semester']];
+
+    // If we haven't set a school year for this block yet, take it from the grade
+    if (empty($block['school_year']) && !empty($g['school_year'])) {
+        $block['school_year'] = $g['school_year'];
+    }
+
+    // Group by subject_code (fallback to subject_name)
+    $key = !empty($g['code']) ? $g['code'] : ('__' . $g['name']);
+
+    if (!isset($block['subjects'][$key])) {
+        $block['subjects'][$key] = [
+            'code'      => $g['code'],
+            'name'      => $g['name'],
+            'terms'     => [],   // 1st/2nd/3rd term grades
+            'final'     => null,
+            'remark'    => $g['remarks'] ?? null,
+        ];
+    }
+
+    if ($g['grade'] !== null && is_numeric($g['grade'])) {
+        $block['subjects'][$key]['terms'][$g['term']] = (float)$g['grade'];
+    }
+    if (!empty($g['remarks'])) {
+        $block['subjects'][$key]['remark'] = $g['remarks'];
+    }
+}
+unset($block);
+
+// Compute final grade per subject (average across terms within the semester)
+foreach ($sf10 as $gl => &$semesters) {
+    foreach ($semesters as $semName => &$block) {
+        $finalGrades = [];
+        foreach ($block['subjects'] as &$subj) {
+            if (!empty($subj['terms'])) {
+                $vals = array_values($subj['terms']);
+                $subj['final'] = round(array_sum($vals) / count($vals), 2);
+            }
+            if ($subj['final'] !== null) $finalGrades[] = $subj['final'];
+        }
+        unset($subj);
+
+        // Sort subjects alphabetically by code
+        uasort($block['subjects'], function($a, $b) {
+            return strcasecmp($a['code'] ?: $a['name'], $b['code'] ?: $b['name']);
+        });
+
+        $block['gwa'] = count($finalGrades) > 0
+            ? round(array_sum($finalGrades) / count($finalGrades), 2)
+            : null;
+    }
+}
+unset($semesters);
+
+// Overall GWA across all blocks
 $allFinalGrades = [];
-foreach ($sf10 as $gradeLevel => $semesters) {
+foreach ($sf10 as $gl => $semesters) {
     foreach ($semesters as $semName => $block) {
         foreach ($block['subjects'] as $subj) {
             if ($subj['final'] !== null) $allFinalGrades[] = $subj['final'];
@@ -202,12 +239,12 @@ $overall_gwa = count($allFinalGrades) > 0
 
 // Grade-level GWAs
 $gradeLevelGwa = [];
-foreach ($sf10 as $gradeLevel => $semesters) {
+foreach ($sf10 as $gl => $semesters) {
     $vals = [];
     foreach ($semesters as $semName => $block) {
         if ($block['gwa'] !== null) $vals[] = $block['gwa'];
     }
-    $gradeLevelGwa[$gradeLevel] = count($vals) > 0
+    $gradeLevelGwa[$gl] = count($vals) > 0
         ? round(array_sum($vals) / count($vals), 2)
         : null;
 }
@@ -450,26 +487,16 @@ $address = implode(', ', array_filter([
                 </div>
 
                 <?php if ($hasGrades): ?>
-                    <?php
-                    // Does any subject have quarter data?
-                    $hasQuarters = false;
-                    foreach ($subjects as $subj) {
-                        if (!empty($subj['quarters'])) { $hasQuarters = true; break; }
-                    }
-                    ?>
                     <table class="grades-table">
                         <thead>
                             <tr>
                                 <th style="width:14%">Subject Code</th>
                                 <th style="width:36%">Subject Title</th>
-                                <?php if ($hasQuarters): ?>
-                                    <th style="width:9%">1st Q</th>
-                                    <th style="width:9%">2nd Q</th>
-                                    <th style="width:9%">3rd Q</th>
-                                    <th style="width:9%">4th Q</th>
-                                <?php endif; ?>
-                                <th style="width:10%">Final</th>
-                                <th style="width:13%">Remarks</th>
+                                <th style="width:12%">1st Term</th>
+                                <th style="width:12%">2nd Term</th>
+                                <th style="width:12%">3rd Term</th>
+                                <th style="width:9%">Final</th>
+                                <th style="width:15%">Remarks</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -477,18 +504,15 @@ $address = implode(', ', array_filter([
                                 <tr>
                                     <td class="center"><?= h(nz($subj['code'])) ?></td>
                                     <td><?= h(nz($subj['name'])) ?></td>
-                                    <?php if ($hasQuarters): ?>
-                                        <td class="center"><?= isset($subj['quarters']['1st Quarter']) ? number_format($subj['quarters']['1st Quarter'], 2) : '—' ?></td>
-                                        <td class="center"><?= isset($subj['quarters']['2nd Quarter']) ? number_format($subj['quarters']['2nd Quarter'], 2) : '—' ?></td>
-                                        <td class="center"><?= isset($subj['quarters']['3rd Quarter']) ? number_format($subj['quarters']['3rd Quarter'], 2) : '—' ?></td>
-                                        <td class="center"><?= isset($subj['quarters']['4th Quarter']) ? number_format($subj['quarters']['4th Quarter'], 2) : '—' ?></td>
-                                    <?php endif; ?>
+                                    <td class="center"><?= isset($subj['terms']['1st Term']) ? number_format($subj['terms']['1st Term'], 2) : '—' ?></td>
+                                    <td class="center"><?= isset($subj['terms']['2nd Term']) ? number_format($subj['terms']['2nd Term'], 2) : '—' ?></td>
+                                    <td class="center"><?= isset($subj['terms']['3rd Term']) ? number_format($subj['terms']['3rd Term'], 2) : '—' ?></td>
                                     <td class="center"><strong><?= $subj['final'] !== null ? number_format($subj['final'], 2) : '—' ?></strong></td>
                                     <td class="center"><?= h(!empty($subj['remark']) ? $subj['remark'] : autoRemark($subj['final'])) ?></td>
                                 </tr>
                             <?php endforeach; ?>
                             <tr class="gwa-row">
-                                <td colspan="<?= $hasQuarters ? 6 : 2 ?>">General Average for <?= h($semName) ?>:</td>
+                                <td colspan="5">General Average for <?= h($semName) ?>:</td>
                                 <td class="val"><?= $block['gwa'] !== null ? number_format($block['gwa'], 2) : '—' ?></td>
                                 <td></td>
                             </tr>
@@ -504,8 +528,9 @@ $address = implode(', ', array_filter([
             <!-- Grade-level GWA -->
             <table class="grades-table" style="margin:0">
                 <tr class="gwa-row" style="background:#e8e8e8">
-                    <td colspan="2" style="text-align:right"><strong><?= strtoupper($gradeLevel) ?> GENERAL AVERAGE:</strong></td>
+                    <td colspan="5" style="text-align:right"><strong><?= strtoupper($gradeLevel) ?> GENERAL AVERAGE:</strong></td>
                     <td class="val" style="width:20%"><strong><?= $gradeLevelGwa[$gradeLevel] !== null ? number_format($gradeLevelGwa[$gradeLevel], 2) : '—' ?></strong></td>
+                    <td style="width:15%"></td>
                 </tr>
             </table>
         </div>
@@ -559,4 +584,3 @@ $address = implode(', ', array_filter([
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
-
