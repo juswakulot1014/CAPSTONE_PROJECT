@@ -1,17 +1,12 @@
 <?php
-session_start();
-include "../config/db.php";
-
-if (!isset($_SESSION['admin_id'])) {
-    header("Location: admin_login.php");
-    exit();
-}
+require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/audit.php';
 
 $student_id = (int)($_GET['id'] ?? 0);
 if ($student_id <= 0) { die("Invalid student ID"); }
 
 // Fetch complete student data
-$stmt = $conn->prepare("SELECT s.*, p.father_name, p.father_occupation, p.father_contact, p.mother_maiden_name, p.mother_occupation, p.mother_contact, p.ave_family_income, p.guardian_fullname, p.guardian_relation, p.guardian_contact, p.household_id as parent_household_id, a.purok_street, a.barangay, a.town_city, a.province, a.region, a.district, a.postal_code, e.grade_level, e.track, e.strand, e.program, e.section, e.school_year, e.semester, e.voucher_status, e.household_id, COALESCE(e.status, 'Active') AS status FROM students_info s LEFT JOIN parents_info p ON s.student_id = p.student_id LEFT JOIN addresses a ON s.student_id = a.student_id LEFT JOIN enrollment_form e ON s.student_id = e.student_id WHERE s.student_id = ? ORDER BY e.enrollment_id DESC LIMIT 1");
+$stmt = $conn->prepare("SELECT s.*, p.father_name, p.father_occupation, p.father_contact, p.mother_maiden_name, p.mother_occupation, p.mother_contact, p.ave_family_income, p.guardian_fullname, p.guardian_relation, p.guardian_contact, p.household_id as parent_household_id, a.purok_street, a.barangay, a.town_city, a.province, a.region, a.district, a.postal_code, e.grade_level, e.track, e.strand, e.program, e.section, e.school_year, e.term, e.voucher_status, e.household_id, COALESCE(e.status, 'Active') AS status FROM students_info s LEFT JOIN parents_info p ON s.student_id = p.student_id LEFT JOIN addresses a ON s.student_id = a.student_id LEFT JOIN enrollment_form e ON s.student_id = e.student_id WHERE s.student_id = ? ORDER BY e.enrollment_id DESC LIMIT 1");
 $stmt->bind_param("i", $student_id);
 $stmt->execute();
 $student = $stmt->get_result()->fetch_assoc() ?: [];
@@ -27,10 +22,27 @@ $edu_stmt->close();
 $edu_data = [];
 foreach ($education_rows as $edu) { $edu_data[$edu['level']] = $edu; }
 
+$religion_options = [
+    'Roman Catholic',
+    'Islam',
+    'Iglesia ni Cristo',
+    'Protestant',
+    'Born Again Christian',
+    'Seventh-Day Adventist',
+    "Jehovah's Witnesses",
+    'Bible Baptist',
+    'Mormon (LDS)',
+    'Buddhism',
+    'Hinduism',
+    'Atheist',
+];
+
 $errors = [];
 $old = $student;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    verify_csrf();
+
     $old = array_merge($old, $_POST);
     if (isset($_POST['school_name']) && is_array($_POST['school_name'])) {
         foreach ($_POST['school_name'] as $level => $value) {
@@ -84,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $program = trim($_POST['program'] ?? '');
         $section = trim($_POST['section'] ?? '');
         $school_year = trim($_POST['school_year'] ?? '');
-        $semester = trim($_POST['semester'] ?? '');
+        $term = trim($_POST['term'] ?? '');
         $student_status = trim($_POST['status'] ?? 'Active');
         $voucher_status = $_POST['voucher_status'] ?? null;
         $household_id = trim($_POST['household_id'] ?? '');
@@ -104,15 +116,76 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!empty($errors)) throw new Exception("Please correct the errors below.");
 
         // Update students_info
+        // FIXED: type string correctly matches values
+        //   position 12 = 's' for religion
+        //   position 14 = 'd' for weight
         $stmt = $conn->prepare("UPDATE students_info SET lrn=?,first_name=?,middle_name=?,last_name=?,nick_name=?,ext_name=?,sex=?,birth_date=?,age=?,civil_status=?,nationality=?,religion=?,height=?,weight=?,email=?,phone=?,special_skills=? WHERE student_id=?");
-        $stmt->bind_param("ssssssssissddssssi", $lrn, $first_name, $middle_name, $last_name, $nick_name, $ext_name, $sex, $birth_date, $age, $civil_status, $nationality, $religion, $height, $weight, $email, $phone, $special_skills, $student_id);
+        $stmt->bind_param("ssssssssisssddsssi",
+            $lrn,
+            $first_name,
+            $middle_name,
+            $last_name,
+            $nick_name,
+            $ext_name,
+            $sex,
+            $birth_date,
+            $age,
+            $civil_status,
+            $nationality,
+            $religion,
+            $height,
+            $weight,
+            $email,
+            $phone,
+            $special_skills,
+            $student_id
+        );
         $stmt->execute(); if ($stmt->error) throw new Exception("Error: " . $stmt->error);
 
         // Parents upsert
-        $stmt = $conn->prepare("SELECT COUNT(*) FROM parents_info WHERE student_id=?"); $stmt->bind_param("i",$student_id); $stmt->execute(); $stmt->bind_result($pe); $stmt->fetch(); $stmt->close();
-        if($pe){$stmt=$conn->prepare("UPDATE parents_info SET father_name=?,father_occupation=?,father_contact=?,mother_maiden_name=?,mother_occupation=?,mother_contact=?,ave_family_income=?,guardian_fullname=?,guardian_relation=?,guardian_contact=?,household_id=? WHERE student_id=?"); $stmt->bind_param("sssssssdsssi",$father_name,$father_occupation,$father_contact,$mother_maiden_name,$mother_occupation,$mother_contact,$ave_family_income,$guardian_fullname,$guardian_relation,$guardian_contact,$household_id,$student_id);}
-        else{$stmt=$conn->prepare("INSERT INTO parents_info (student_id,father_name,father_occupation,father_contact,mother_maiden_name,mother_occupation,mother_contact,ave_family_income,guardian_fullname,guardian_relation,guardian_contact,household_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"); $stmt->bind_param("issssssdssss",$student_id,$father_name,$father_occupation,$father_contact,$mother_maiden_name,$mother_occupation,$mother_contact,$ave_family_income,$guardian_fullname,$guardian_relation,$guardian_contact,$household_id);}
-        $stmt->execute(); if ($stmt->error) throw new Exception("Parents error: ".$stmt->error);
+        $stmt = $conn->prepare("SELECT COUNT(*) FROM parents_info WHERE student_id=?");
+        $stmt->bind_param("i",$student_id);
+        $stmt->execute();
+        $stmt->bind_result($pe);
+        $stmt->fetch();
+        $stmt->close();
+
+        if ($pe) {
+            $stmt = $conn->prepare("UPDATE parents_info SET father_name=?,father_occupation=?,father_contact=?,mother_maiden_name=?,mother_occupation=?,mother_contact=?,ave_family_income=?,guardian_fullname=?,guardian_relation=?,guardian_contact=?,household_id=? WHERE student_id=?");
+            $stmt->bind_param("ssssssdssssi",
+                $father_name,
+                $father_occupation,
+                $father_contact,
+                $mother_maiden_name,
+                $mother_occupation,
+                $mother_contact,
+                $ave_family_income,
+                $guardian_fullname,
+                $guardian_relation,
+                $guardian_contact,
+                $household_id,
+                $student_id
+            );
+        } else {
+            $stmt = $conn->prepare("INSERT INTO parents_info (student_id,father_name,father_occupation,father_contact,mother_maiden_name,mother_occupation,mother_contact,ave_family_income,guardian_fullname,guardian_relation,guardian_contact,household_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+            $stmt->bind_param("issssssdssss",
+                $student_id,
+                $father_name,
+                $father_occupation,
+                $father_contact,
+                $mother_maiden_name,
+                $mother_occupation,
+                $mother_contact,
+                $ave_family_income,
+                $guardian_fullname,
+                $guardian_relation,
+                $guardian_contact,
+                $household_id
+            );
+        }
+        $stmt->execute();
+        if ($stmt->error) throw new Exception("Parents error: ".$stmt->error);
+        $stmt->close();
 
         // Address upsert
         $stmt=$conn->prepare("SELECT COUNT(*) FROM addresses WHERE student_id=?"); $stmt->bind_param("i",$student_id); $stmt->execute(); $stmt->bind_result($ae); $stmt->fetch(); $stmt->close();
@@ -122,8 +195,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // Enrollment upsert
         $stmt=$conn->prepare("SELECT COUNT(*) FROM enrollment_form WHERE student_id=?"); $stmt->bind_param("i",$student_id); $stmt->execute(); $stmt->bind_result($ee); $stmt->fetch(); $stmt->close();
-        if($ee){$stmt=$conn->prepare("UPDATE enrollment_form SET grade_level=?,track=?,strand=?,program=?,section=?,school_year=?,semester=?,status=?,voucher_status=?,household_id=? WHERE student_id=?"); $stmt->bind_param("ssssssssssi",$grade_level,$track,$strand,$program,$section,$school_year,$semester,$student_status,$voucher_status,$household_id,$student_id);}
-        elseif(!empty($grade_level)||!empty($school_year)){$stmt=$conn->prepare("INSERT INTO enrollment_form (student_id,grade_level,track,strand,program,section,school_year,semester,status,voucher_status,household_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)"); $stmt->bind_param("issssssssss",$student_id,$grade_level,$track,$strand,$program,$section,$school_year,$semester,$student_status,$voucher_status,$household_id);}
+        if($ee){$stmt=$conn->prepare("UPDATE enrollment_form SET grade_level=?,track=?,strand=?,program=?,section=?,school_year=?,term=?,status=?,voucher_status=?,household_id=? WHERE student_id=?"); $stmt->bind_param("ssssssssssi",$grade_level,$track,$strand,$program,$section,$school_year,$term,$student_status,$voucher_status,$household_id,$student_id);}
+        elseif(!empty($grade_level)||!empty($school_year)){$stmt=$conn->prepare("INSERT INTO enrollment_form (student_id,grade_level,track,strand,program,section,school_year,term,status,voucher_status,household_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)"); $stmt->bind_param("issssssssss",$student_id,$grade_level,$track,$strand,$program,$section,$school_year,$term,$student_status,$voucher_status,$household_id);}
         if(isset($stmt)){$stmt->execute(); if($stmt->error)throw new Exception("Enrollment error: ".$stmt->error);}
 
         // Educational history
@@ -140,6 +213,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
+        // ---- Audit the student_info update with a diff ----
+        audit_diff($conn, 'student.update', [
+            'lrn'            => $student['lrn']            ?? null,
+            'first_name'     => $student['first_name']     ?? null,
+            'middle_name'    => $student['middle_name']    ?? null,
+            'last_name'      => $student['last_name']      ?? null,
+            'nick_name'      => $student['nick_name']      ?? null,
+            'ext_name'       => $student['ext_name']       ?? null,
+            'sex'            => $student['sex']            ?? null,
+            'birth_date'     => $student['birth_date']     ?? null,
+            'age'            => $student['age']            ?? null,
+            'civil_status'   => $student['civil_status']   ?? null,
+            'nationality'    => $student['nationality']    ?? null,
+            'religion'       => $student['religion']       ?? null,
+            'height'         => $student['height']         ?? null,
+            'weight'         => $student['weight']         ?? null,
+            'email'          => $student['email']          ?? null,
+            'phone'          => $student['phone']          ?? null,
+            'special_skills' => $student['special_skills'] ?? null,
+        ], [
+            'lrn'            => $lrn,
+            'first_name'     => $first_name,
+            'middle_name'    => $middle_name ?: null,
+            'last_name'      => $last_name,
+            'nick_name'      => $nick_name ?: null,
+            'ext_name'       => $ext_name ?: null,
+            'sex'            => $sex,
+            'birth_date'     => $birth_date,
+            'age'            => $age,
+            'civil_status'   => $civil_status ?: null,
+            'nationality'    => $nationality,
+            'religion'       => $religion ?: null,
+            'height'         => $height,
+            'weight'         => $weight,
+            'email'          => $email ?: null,
+            'phone'          => $phone ?: null,
+            'special_skills' => $special_skills ?: null,
+        ], 'student', $student_id);
+
         $conn->commit();
         $_SESSION['success'] = "Student record updated!";
         header("Location: view_student.php?id=$student_id"); exit();
@@ -148,6 +260,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $status_options = ['Active', 'Transferred', 'Stopped', 'Dropped'];
 $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 'dark' : 'light';
+
+$current_religion = trim((string)($old['religion'] ?? ''));
+$religion_is_known = in_array($current_religion, $religion_options, true);
+$religion_select_value = $religion_is_known ? $current_religion : ($current_religion !== '' ? '__other__' : '');
 ?>
 
 <!DOCTYPE html>
@@ -174,7 +290,7 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
         }
         *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
         body{background:var(--bg);color:var(--text);min-height:100vh}
-        
+
         .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
         .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
         .sidebar-brand img{width:40px;height:40px;border-radius:10px}
@@ -184,32 +300,32 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
         .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
         .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
         .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
-        
+
         .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
         .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
         .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
-        
+
         .card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);margin-bottom:1.25rem;overflow:hidden}
         .card-header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
         .card-header h3{margin:0;font-size:0.95rem;font-weight:600}
         .card-header i{color:var(--accent);font-size:1.2rem}
         .card-body{padding:1.5rem}
-        
+
         .form-label{font-size:0.8rem;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:0.35rem}
         .form-label.required::after{content:" *";color:var(--red)}
         .form-control,.form-select{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:0.65rem 1rem;font-size:0.9rem;color:var(--text);transition:all 0.2s}
         .form-control:focus,.form-select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,0.15);outline:none}
-        
+
         .edu-block{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1rem}
-        
+
         .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center}
         .theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}
         .btn{font-weight:500;border-radius:8px}
-        
+
         .badge-pill{display:inline-flex;align-items:center;gap:0.3rem;padding:0.25rem 0.7rem;border-radius:50px;font-size:0.72rem;font-weight:600}
         .badge-pill.success{background:#d1fae5;color:#065f46}.badge-pill.warning{background:#fef3c7;color:#92400e}.badge-pill.danger{background:#fee2e2;color:#991b1b}.badge-pill.info{background:#dbeafe;color:#1e40af}
         [data-bs-theme="dark"] .badge-pill.success{background:#064e3b;color:#6ee7b7}[data-bs-theme="dark"] .badge-pill.warning{background:#78350f;color:#fcd34d}[data-bs-theme="dark"] .badge-pill.danger{background:#7f1d1d;color:#fca5a5}[data-bs-theme="dark"] .badge-pill.info{background:#1e3a5f;color:#93c5fd}
-        
+
         @media(max-width:1024px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main-content{margin-left:0}.menu-toggle{display:flex}}
         @media(max-width:640px){.main-content{padding:1rem}}
     </style>
@@ -242,6 +358,8 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     </div>
 
     <form method="POST" id="editForm">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8') ?>">
+
         <!-- Basic Info -->
         <div class="card">
             <div class="card-header"><i class="bi bi-person-vcard"></i><h3>Basic Information</h3></div>
@@ -258,7 +376,28 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
                     <div class="col-md-4"><label class="form-label required">Sex</label><select name="sex" class="form-select" required><option value="">Select</option><option value="Male" <?= ($old['sex']??'')=='Male'?'selected':'' ?>>Male</option><option value="Female" <?= ($old['sex']??'')=='Female'?'selected':'' ?>>Female</option></select></div>
                     <div class="col-md-4"><label class="form-label">Civil Status</label><select name="civil_status" class="form-select"><option value="">Select</option><option value="Single" <?= ($old['civil_status']??'')=='Single'?'selected':'' ?>>Single</option><option value="Married" <?= ($old['civil_status']??'')=='Married'?'selected':'' ?>>Married</option></select></div>
                     <div class="col-md-4"><label class="form-label">Nationality</label><input type="text" name="nationality" class="form-control" value="<?= htmlspecialchars($old['nationality']??'Filipino') ?>"></div>
-                    <div class="col-md-4"><label class="form-label">Religion</label><input type="text" name="religion" class="form-control" value="<?= htmlspecialchars($old['religion']??'') ?>"></div>
+
+                    <!-- Religion — real dropdown + "Other" text input -->
+                    <div class="col-md-4">
+                        <label class="form-label">Religion</label>
+                        <select id="religion_select" class="form-select" onchange="syncReligion()">
+                            <option value="">— Select Religion —</option>
+                            <?php foreach ($religion_options as $r): ?>
+                                <option value="<?= htmlspecialchars($r) ?>" <?= $religion_select_value === $r ? 'selected' : '' ?>>
+                                    <?= htmlspecialchars($r) ?>
+                                </option>
+                            <?php endforeach; ?>
+                            <option value="__other__" <?= $religion_select_value === '__other__' ? 'selected' : '' ?>>Other (specify)</option>
+                        </select>
+                        <input type="text"
+                               id="religion_other"
+                               class="form-control mt-2"
+                               placeholder="Enter religion"
+                               style="<?= $religion_select_value === '__other__' ? '' : 'display:none;' ?>"
+                               value="<?= $religion_select_value === '__other__' ? htmlspecialchars($current_religion) : '' ?>">
+                        <input type="hidden" name="religion" id="religion_hidden" value="<?= htmlspecialchars($current_religion) ?>">
+                    </div>
+
                     <div class="col-md-2"><label class="form-label">Height (cm)</label><input type="number" step="0.01" name="height" class="form-control" value="<?= htmlspecialchars($old['height']??'') ?>"></div>
                     <div class="col-md-2"><label class="form-label">Weight (kg)</label><input type="number" step="0.01" name="weight" class="form-control" value="<?= htmlspecialchars($old['weight']??'') ?>"></div>
                     <div class="col-md-4"><label class="form-label">Email</label><input type="email" name="email" class="form-control" value="<?= htmlspecialchars($old['email']??'') ?>"></div>
@@ -312,7 +451,7 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
                     <div class="col-md-3"><label class="form-label">Grade Level</label><input type="text" name="grade_level" class="form-control" value="<?= htmlspecialchars($old['grade_level']??'') ?>"></div>
                     <div class="col-md-3"><label class="form-label">School Year</label><input type="text" name="school_year" class="form-control" value="<?= htmlspecialchars($old['school_year']??'') ?>"></div>
                     <div class="col-md-3"><label class="form-label">Section</label><input type="text" name="section" class="form-control" value="<?= htmlspecialchars($old['section']??'') ?>"></div>
-                    <div class="col-md-3"><label class="form-label">Semester</label><input type="text" name="semester" class="form-control" value="<?= htmlspecialchars($old['semester']??'') ?>"></div>
+                    <div class="col-md-3"><label class="form-label">Term</label><input type="text" name="term" class="form-control" value="<?= htmlspecialchars($old['term']??'') ?>"></div>
                     <div class="col-md-4"><label class="form-label">Track</label><input type="text" name="track" class="form-control bg-light" value="<?= htmlspecialchars($old['track']??'TECHPRO ELECTIVES') ?>" readonly></div>
                     <div class="col-md-4"><label class="form-label">Strand</label><select name="strand" id="strand" class="form-select"><option value="">Select</option></select></div>
                     <div class="col-md-4"><label class="form-label">Program</label><select name="program" id="program" class="form-select"><option value="">Select</option></select></div>
@@ -359,6 +498,27 @@ const tb=document.getElementById('themeToggle'),ti=document.getElementById('them
 function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
 (function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();
 tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
+
+// Religion select <-> text input sync
+function syncReligion() {
+    const sel = document.getElementById('religion_select');
+    const inp = document.getElementById('religion_other');
+    const hid = document.getElementById('religion_hidden');
+
+    if (sel.value === '__other__') {
+        inp.style.display = 'block';
+        inp.focus();
+        hid.value = inp.value.trim();
+    } else {
+        inp.style.display = 'none';
+        inp.value = '';
+        hid.value = sel.value;
+    }
+}
+
+document.getElementById('religion_other').addEventListener('input', function () {
+    document.getElementById('religion_hidden').value = this.value.trim();
+});
 
 // Age calc
 document.getElementById('birth_date').addEventListener('change',function(){const b=new Date(this.value),t=new Date();let a=t.getFullYear()-b.getFullYear();if(t.getMonth()<b.getMonth()||(t.getMonth()===b.getMonth()&&t.getDate()<b.getDate()))a--;document.getElementById('age').value=a>=0?a:''});

@@ -90,6 +90,41 @@ function verify_csrf(bool $rotate = false): void {
     }
 }
 
+// ---------- Rate limiting (session-based) ----------
+// Usage:
+//   $rl = rate_limit_check('login_1.2.3.4', 5, 900);
+//   if ($rl['locked']) { ... }
+//   rate_limit_hit('login_1.2.3.4');       // on failure
+//   rate_limit_reset('login_1.2.3.4');     // on success
+function rate_limit_check(string $key, int $max = 5, int $window = 900): array {
+    $k = 'rl_' . $key;
+    $now = time();
+    if (!isset($_SESSION[$k])) {
+        $_SESSION[$k] = ['count' => 0, 'start' => $now];
+    }
+    if ($now - $_SESSION[$k]['start'] > $window) {
+        $_SESSION[$k] = ['count' => 0, 'start' => $now];
+    }
+    $b = $_SESSION[$k];
+    return [
+        'count'       => $b['count'],
+        'remaining'   => max(0, $max - $b['count']),
+        'window_left' => max(0, $window - ($now - $b['start'])),
+        'locked'      => $b['count'] >= $max,
+    ];
+}
+function rate_limit_hit(string $key): void {
+    $k = 'rl_' . $key;
+    $now = time();
+    if (!isset($_SESSION[$k])) {
+        $_SESSION[$k] = ['count' => 0, 'start' => $now];
+    }
+    $_SESSION[$k]['count']++;
+}
+function rate_limit_reset(string $key): void {
+    unset($_SESSION['rl_' . $key]);
+}
+
 // ---------- Auth guards ----------
 function require_admin(): void {
     if (empty($_SESSION['admin_id'])) {
@@ -109,6 +144,28 @@ function require_superadmin(): void {
     if (($_SESSION['admin_role'] ?? '') !== 'superadmin') {
         http_response_code(403);
         exit('Forbidden — Super Admin only.');
+    }
+}
+/**
+ * Unified guard. Pass a role to enforce it. Pass null to just require login.
+ * Preserves intended destination for post-login redirect.
+ */
+function require_role(?string $role = null): void {
+    if (empty($_SESSION['admin_id'])) {
+        $_SESSION['redirect_after_login'] = $_SERVER['REQUEST_URI'] ?? 'dashboard.php';
+        header('Location: admin_login.php');
+        exit;
+    }
+    $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    if (isset($_SESSION['user_agent']) && !hash_equals($_SESSION['user_agent'], $ua)) {
+        session_unset();
+        session_destroy();
+        header('Location: admin_login.php?timeout=1');
+        exit;
+    }
+    if ($role !== null && ($_SESSION['admin_role'] ?? '') !== $role) {
+        http_response_code(403);
+        exit('Forbidden.');
     }
 }
 function require_post(): void {

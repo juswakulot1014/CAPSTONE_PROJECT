@@ -1,24 +1,11 @@
 <?php
-// admin/view_document.php — secure document streaming endpoint
-// Usage:  view_document.php?id=123          (inline in browser)
-//         view_document.php?id=123&dl=1     (force download)
+require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/crypto.php';
 
-if (session_status() === PHP_SESSION_NONE) session_start();
-require_once __DIR__ . "/../config/db.php";
-require_once __DIR__ . "/../config/paths.php";
-require_once __DIR__ . "/../config/crypto.php";
+$admin_id = (int)$_SESSION['admin_id'];
 
 /* ───────────────────────────────────────────────
-   1. Auth gate — admin must be logged in
-   ─────────────────────────────────────────────── */
-$admin_id = $_SESSION['admin_id'] ?? $_SESSION['user_id'] ?? null;
-if ($admin_id === null) {
-    http_response_code(401);
-    exit('Unauthorized');
-}
-
-/* ───────────────────────────────────────────────
-   2. Input validation
+   1. Input validation
    ─────────────────────────────────────────────── */
 $doc_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 if (!$doc_id || $doc_id < 1) {
@@ -28,14 +15,15 @@ if (!$doc_id || $doc_id < 1) {
 $force_download = isset($_GET['dl']) && $_GET['dl'] === '1';
 
 /* ───────────────────────────────────────────────
-   3. Fetch the document row
+   2. Fetch the document row
    ─────────────────────────────────────────────── */
 $stmt = $conn->prepare("
-    SELECT d.id, d.student_id, d.document_name, d.file_path, d.file_mime, d.file_name,
+    SELECT d.entrance_id, d.student_id, d.document_name,
+           d.file_path, d.file_mime, d.file_name,
            s.student_id_number, s.first_name, s.last_name
     FROM entrance_documents d
     JOIN students_info s ON s.student_id = d.student_id
-    WHERE d.id = ? AND d.submitted = 1 AND d.file_path IS NOT NULL
+    WHERE d.entrance_id = ? AND d.submitted = 1 AND d.file_path IS NOT NULL
     LIMIT 1
 ");
 if (!$stmt) {
@@ -54,7 +42,7 @@ if (!$doc) {
 }
 
 /* ───────────────────────────────────────────────
-   4. Resolve the file on disk (must live in DOCUMENTS_DIR)
+   3. Resolve the file on disk (must live in DOCUMENTS_DIR)
    ─────────────────────────────────────────────── */
 $abs_path = realpath(DOCUMENTS_DIR . basename($doc['file_path']));
 $base_dir = realpath(DOCUMENTS_DIR);
@@ -73,12 +61,13 @@ if ($plain === false || $plain === '') {
 }
 
 /* ───────────────────────────────────────────────
-   5. Audit log
+   4. Audit log
    ─────────────────────────────────────────────── */
 $ip = $_SERVER['REMOTE_ADDR'] ?? '';
 $ua = substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 255);
 $log = $conn->prepare("
-    INSERT INTO document_access_log (document_id, student_id, admin_id, action, ip_address, user_agent, accessed_at)
+    INSERT INTO document_access_log
+        (document_id, student_id, admin_id, action, ip_address, user_agent, accessed_at)
     VALUES (?, ?, ?, ?, ?, ?, NOW())
 ");
 if ($log) {
@@ -96,7 +85,7 @@ if ($log) {
 }
 
 /* ───────────────────────────────────────────────
-   6. Stream to client
+   5. Stream to client
    ─────────────────────────────────────────────── */
 $allowed_mimes = [
     'application/pdf' => 'pdf',
@@ -107,13 +96,17 @@ $mime = $doc['file_mime'];
 if (!isset($allowed_mimes[$mime])) $mime = 'application/octet-stream';
 
 $ext_map = [
-    'application/pdf' => 'pdf',
-    'image/jpeg'      => 'jpg',
-    'image/png'       => 'png',
+    'application/pdf'          => 'pdf',
+    'image/jpeg'               => 'jpg',
+    'image/png'                => 'png',
     'application/octet-stream' => 'bin',
 ];
 
-$safe_name = preg_replace('/[^A-Za-z0-9._\- ]/', '_', $doc['file_name'] ?: ($doc['document_name'] . '.' . ($ext_map[$mime] ?? 'bin')));
+$safe_name = preg_replace(
+    '/[^A-Za-z0-9._\- ]/',
+    '_',
+    $doc['file_name'] ?: ($doc['document_name'] . '.' . ($ext_map[$mime] ?? 'bin'))
+);
 $safe_name = str_replace(["\r", "\n", '"'], '', $safe_name);
 if ($safe_name === '') {
     $safe_name = 'document.' . ($ext_map[$mime] ?? 'bin');

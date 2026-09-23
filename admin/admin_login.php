@@ -1,54 +1,39 @@
 <?php
-session_start();
-include "../config/db.php";
+require_once __DIR__ . '/../config/bootstrap.php';
+require_once __DIR__ . '/../config/audit.php';
 
-$error = "";
+$error = '';
 
-$remember_cookie_name = 'admin_remember_token';
+$remember_cookie_name   = 'admin_remember_token';
 $remember_duration_days = 30;
-$remember_duration_seconds = 86400 * $remember_duration_days;
+$remember_duration_secs = 86400 * $remember_duration_days;
 
-// Rate limiting
-$max_attempts = 3;
-$lockout_time = 900; // 15 minutes
-$rate_limit_key = 'login_attempts_' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+$rl_key = 'login_' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+$rl = rate_limit_check($rl_key, 3, 900);
 
-if (!isset($_SESSION[$rate_limit_key])) {
-    $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
+if ($rl['locked']) {
+    $mins = (int)ceil($rl['window_left'] / 60);
+    $error = "Too many login attempts. Please try again in {$mins} minute(s).";
 }
 
-// Check if locked out
-if ($_SESSION[$rate_limit_key]['count'] >= $max_attempts) {
-    $time_since_last = time() - $_SESSION[$rate_limit_key]['last_attempt'];
-    if ($time_since_last < $lockout_time) {
-        $remaining = ceil(($lockout_time - $time_since_last) / 60);
-        $error = "Too many login attempts. Please try again in {$remaining} minute(s).";
-    } else {
-        // Reset after lockout period
-        $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
-    }
-}
-
-// 1. Auto-login from Remember Me cookie
+/* ---------- 1. Auto-login from Remember Me cookie ---------- */
 if (!isset($_SESSION['admin_id']) && isset($_COOKIE[$remember_cookie_name]) && empty($error)) {
     $token = $_COOKIE[$remember_cookie_name];
 
-    // FIXED: Added proper error handling and token validation
     $stmt = $conn->prepare("
-        SELECT id, fullname, username, role 
-        FROM admins 
-        WHERE remember_token = ? 
-          AND remember_expires > NOW() 
+        SELECT id, fullname, username, role
+        FROM admins
+        WHERE remember_token = ?
+          AND remember_expires > NOW()
         LIMIT 1
     ");
-    
     if ($stmt) {
-        $stmt->bind_param("s", $token);
+        $stmt->bind_param('s', $token);
         $stmt->execute();
-        $result = $stmt->get_result();
+        $res = $stmt->get_result();
 
-        if ($result->num_rows === 1) {
-            $admin = $result->fetch_assoc();
+        if ($res->num_rows === 1) {
+            $admin = $res->fetch_assoc();
             session_regenerate_id(true);
 
             $_SESSION['admin_id']   = $admin['id'];
@@ -58,216 +43,175 @@ if (!isset($_SESSION['admin_id']) && isset($_COOKIE[$remember_cookie_name]) && e
             $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'] ?? '';
             $_SESSION['ip_address'] = $_SERVER['REMOTE_ADDR'] ?? '';
 
-            // Refresh token - FIXED: Regenerate on each auto-login
-            $new_token = bin2hex(random_bytes(32));
-            $new_expires = date('Y-m-d H:i:s', time() + $remember_duration_seconds);
+            $new_token   = bin2hex(random_bytes(32));
+            $new_expires = date('Y-m-d H:i:s', time() + $remember_duration_secs);
 
             $upd = $conn->prepare("UPDATE admins SET remember_token = ?, remember_expires = ? WHERE id = ?");
             if ($upd) {
-                $upd->bind_param("ssi", $new_token, $new_expires, $admin['id']);
+                $upd->bind_param('ssi', $new_token, $new_expires, $admin['id']);
                 $upd->execute();
                 $upd->close();
             }
 
-            // FIXED: Secure cookie settings
             setcookie($remember_cookie_name, $new_token, [
-                'expires' => time() + $remember_duration_seconds,
-                'path' => '/',
-                'domain' => '',
-                'secure' => isset($_SERVER['HTTPS']),
+                'expires'  => time() + $remember_duration_secs,
+                'path'     => '/',
+                'domain'   => '',
+                'secure'   => is_https(),
                 'httponly' => true,
-                'samesite' => 'Strict'
+                'samesite' => 'Strict',
             ]);
 
-            // Log successful auto-login
-            error_log("Auto-login successful for admin ID: {$admin['id']} from IP: {$_SERVER['REMOTE_ADDR']}");
+            audit_log($conn, 'admin.login_auto', ['type' => 'admin', 'id' => $admin['id']]);
+            header('Location: dashboard.php');
+            exit;
+        }
 
-            header("Location: dashboard.php");
-            exit();
-        } else {
-            // Invalid/expired token - clear it
-            setcookie($remember_cookie_name, '', [
-                'expires' => time() - 3600,
-                'path' => '/',
-                'domain' => '',
-                'secure' => isset($_SERVER['HTTPS']),
-                'httponly' => true,
-                'samesite' => 'Strict'
-            ]);
-            
-            // Clear token from database for security
-            $clear = $conn->prepare("UPDATE admins SET remember_token = NULL, remember_expires = NULL WHERE remember_token = ?");
-            if ($clear) {
-                $clear->bind_param("s", $token);
-                $clear->execute();
-                $clear->close();
-            }
+        // Invalid/expired token — clear it
+        setcookie($remember_cookie_name, '', [
+            'expires'  => time() - 3600,
+            'path'     => '/',
+            'domain'   => '',
+            'secure'   => is_https(),
+            'httponly' => true,
+            'samesite' => 'Strict',
+        ]);
+        $clear = $conn->prepare("UPDATE admins SET remember_token = NULL, remember_expires = NULL WHERE remember_token = ?");
+        if ($clear) {
+            $clear->bind_param('s', $token);
+            $clear->execute();
+            $clear->close();
         }
         $stmt->close();
     }
 }
 
-// 2. If already logged in → verify session integrity
+/* ---------- 2. Already logged in → bounce to dashboard ---------- */
 if (isset($_SESSION['admin_id'])) {
-    // FIXED: Session hijacking protection
-    $current_ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
-    $current_ip = $_SERVER['REMOTE_ADDR'] ?? '';
-    
-    if (isset($_SESSION['user_agent']) && $_SESSION['user_agent'] !== $current_ua) {
-        // Possible session hijacking - destroy session
+    if (isset($_SESSION['user_agent'])
+        && !hash_equals($_SESSION['user_agent'], $_SERVER['HTTP_USER_AGENT'] ?? '')) {
+        session_unset();
         session_destroy();
-        header("Location: admin_login.php");
-        exit();
+        header('Location: admin_login.php');
+        exit;
     }
-    
-    header("Location: dashboard.php");
-    exit();
+    header('Location: dashboard.php');
+    exit;
 }
 
-// 3. Process login form
+/* ---------- 3. Process login form ---------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($error)) {
-    // FIXED: CSRF Protection
-    if (!isset($_POST['csrf_token']) || !isset($_SESSION['csrf_token']) || 
-        !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
-        $error = "Invalid security token. Please refresh the page and try again.";
+    verify_csrf();
+
+    $username = trim($_POST['username'] ?? '');
+    $password = $_POST['password'] ?? '';
+    $remember = isset($_POST['remember']);
+
+    if ($username === '' || $password === '') {
+        $error = 'Please fill in all fields.';
     } else {
-        $username = trim($_POST['username'] ?? '');
-        $password = $_POST['password'] ?? ''; // Don't trim password
-        $remember = isset($_POST['remember']);
-
-        if (empty($username) || empty($password)) {
-            $error = "Please fill in all fields.";
+        $stmt = $conn->prepare("
+            SELECT id, fullname, username, password, role
+            FROM admins
+            WHERE username = ?
+            LIMIT 1
+        ");
+        if (!$stmt) {
+            error_log('admin_login: prepare failed: ' . $conn->error);
+            $error = 'System error. Please try again later.';
         } else {
-            // FIXED: Prepared statement with error handling
-            $stmt = $conn->prepare("SELECT id, fullname, username, password, role FROM admins WHERE username = ? LIMIT 1");
-            
-            if ($stmt) {
-                $stmt->bind_param("s", $username);
-                $stmt->execute();
-                $result = $stmt->get_result();
+            $stmt->bind_param('s', $username);
+            $stmt->execute();
+            $res = $stmt->get_result();
 
-                if ($result->num_rows === 1) {
-                    $admin = $result->fetch_assoc();
+            if ($res->num_rows === 1) {
+                $admin = $res->fetch_assoc();
 
-                    if (password_verify($password, $admin['password'])) {
-                        // FIXED: Reset rate limit on successful login
-                        $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
-                        
-                        session_regenerate_id(true);
+                if (password_verify($password, $admin['password'])) {
+                    rate_limit_reset($rl_key);
+                    session_regenerate_id(true);
 
-                        $_SESSION['admin_id']   = $admin['id'];
-                        $_SESSION['admin_name'] = $admin['fullname'];
-                        $_SESSION['admin_role'] = $admin['role'];
-                        $_SESSION['login_time'] = time();
-                        $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'] ?? '';
-                        $_SESSION['ip_address'] = $_SERVER['REMOTE_ADDR'] ?? '';
+                    $_SESSION['admin_id']   = $admin['id'];
+                    $_SESSION['admin_name'] = $admin['fullname'];
+                    $_SESSION['admin_role'] = $admin['role'];
+                    $_SESSION['login_time'] = time();
+                    $_SESSION['user_agent'] = $_SERVER['HTTP_USER_AGENT'] ?? '';
+                    $_SESSION['ip_address'] = $_SERVER['REMOTE_ADDR'] ?? '';
 
-                        // FIXED: Check if password needs rehash
-                        if (password_needs_rehash($admin['password'], PASSWORD_DEFAULT)) {
-                            $new_hash = password_hash($password, PASSWORD_DEFAULT);
-                            $rehash = $conn->prepare("UPDATE admins SET password = ? WHERE id = ?");
-                            if ($rehash) {
-                                $rehash->bind_param("si", $new_hash, $admin['id']);
-                                $rehash->execute();
-                                $rehash->close();
-                            }
+                    if (password_needs_rehash($admin['password'], PASSWORD_DEFAULT)) {
+                        $new_hash = password_hash($password, PASSWORD_DEFAULT);
+                        $rh = $conn->prepare("UPDATE admins SET password = ? WHERE id = ?");
+                        if ($rh) {
+                            $rh->bind_param('si', $new_hash, $admin['id']);
+                            $rh->execute();
+                            $rh->close();
                         }
-
-                        if ($remember) {
-                            $token = bin2hex(random_bytes(32));
-                            $expires = date('Y-m-d H:i:s', time() + $remember_duration_seconds);
-
-                            $upd = $conn->prepare("UPDATE admins SET remember_token = ?, remember_expires = ? WHERE id = ?");
-                            if ($upd) {
-                                $upd->bind_param("ssi", $token, $expires, $admin['id']);
-                                $upd->execute();
-                                $upd->close();
-                            }
-
-                            // FIXED: Secure cookie settings
-                            setcookie($remember_cookie_name, $token, [
-                                'expires' => time() + $remember_duration_seconds,
-                                'path' => '/',
-                                'domain' => '',
-                                'secure' => isset($_SERVER['HTTPS']),
-                                'httponly' => true,
-                                'samesite' => 'Strict'
-                            ]);
-                        } else {
-                            // Clear any existing remember cookie
-                            if (isset($_COOKIE[$remember_cookie_name])) {
-                                $clear_token = $_COOKIE[$remember_cookie_name];
-                                $clear = $conn->prepare("UPDATE admins SET remember_token = NULL, remember_expires = NULL WHERE remember_token = ?");
-                                if ($clear) {
-                                    $clear->bind_param("s", $clear_token);
-                                    $clear->execute();
-                                    $clear->close();
-                                }
-                                
-                                setcookie($remember_cookie_name, '', [
-                                    'expires' => time() - 3600,
-                                    'path' => '/',
-                                    'domain' => '',
-                                    'secure' => isset($_SERVER['HTTPS']),
-                                    'httponly' => true,
-                                    'samesite' => 'Strict'
-                                ]);
-                            }
-                        }
-
-                        // Log successful login
-                        error_log("Successful login for admin: {$admin['username']} from IP: {$_SERVER['REMOTE_ADDR']}");
-
-                        header("Location: dashboard.php");
-                        exit();
-                    } else {
-                        // FIXED: Rate limiting on failed attempt
-                        $_SESSION[$rate_limit_key]['count']++;
-                        $_SESSION[$rate_limit_key]['last_attempt'] = time();
-                        
-                        $remaining = $max_attempts - $_SESSION[$rate_limit_key]['count'];
-                        if ($remaining > 0) {
-                            $error = "Invalid password. {$remaining} attempt(s) remaining.";
-                        } else {
-                            $error = "Too many login attempts. Please try again in 15 minutes.";
-                        }
-                        
-                        // Log failed attempt
-                        error_log("Failed login attempt for username: {$username} from IP: {$_SERVER['REMOTE_ADDR']}");
                     }
-                } else {
-                    // FIXED: Rate limiting on failed attempt
-                    $_SESSION[$rate_limit_key]['count']++;
-                    $_SESSION[$rate_limit_key]['last_attempt'] = time();
-                    
-                    $remaining = $max_attempts - $_SESSION[$rate_limit_key]['count'];
-                    if ($remaining > 0) {
-                        $error = "No account found with that username. {$remaining} attempt(s) remaining.";
-                    } else {
-                        $error = "Too many login attempts. Please try again in 15 minutes.";
+
+                    if ($remember) {
+                        $tk = bin2hex(random_bytes(32));
+                        $ex = date('Y-m-d H:i:s', time() + $remember_duration_secs);
+                        $upd = $conn->prepare("UPDATE admins SET remember_token = ?, remember_expires = ? WHERE id = ?");
+                        if ($upd) {
+                            $upd->bind_param('ssi', $tk, $ex, $admin['id']);
+                            $upd->execute();
+                            $upd->close();
+                        }
+                        setcookie($remember_cookie_name, $tk, [
+                            'expires'  => time() + $remember_duration_secs,
+                            'path'     => '/',
+                            'domain'   => '',
+                            'secure'   => is_https(),
+                            'httponly' => true,
+                            'samesite' => 'Strict',
+                        ]);
+                    } elseif (isset($_COOKIE[$remember_cookie_name])) {
+                        $ct = $_COOKIE[$remember_cookie_name];
+                        $cl = $conn->prepare("UPDATE admins SET remember_token = NULL, remember_expires = NULL WHERE remember_token = ?");
+                        if ($cl) {
+                            $cl->bind_param('s', $ct);
+                            $cl->execute();
+                            $cl->close();
+                        }
+                        setcookie($remember_cookie_name, '', [
+                            'expires'  => time() - 3600,
+                            'path'     => '/',
+                            'domain'   => '',
+                            'secure'   => is_https(),
+                            'httponly' => true,
+                            'samesite' => 'Strict',
+                        ]);
                     }
-                    
-                    // Log failed attempt
-                    error_log("Failed login attempt for non-existent username: {$username} from IP: {$_SERVER['REMOTE_ADDR']}");
+
+                    audit_log($conn, 'admin.login', ['type' => 'admin', 'id' => $admin['id']]);
+                    header('Location: dashboard.php');
+                    exit;
                 }
-                $stmt->close();
+
+                rate_limit_hit($rl_key);
+                $rl = rate_limit_check($rl_key, 5, 900);
+                $error = $rl['remaining'] > 0
+                    ? "Invalid password. {$rl['remaining']} attempt(s) remaining."
+                    : 'Too many login attempts. Please try again in 15 minutes.';
+                audit_log($conn, 'admin.login_failed', ['username' => $username]);
             } else {
-                $error = "System error. Please try again later.";
-                error_log("Database prepare failed in admin_login.php: " . $conn->error);
+                rate_limit_hit($rl_key);
+                $rl = rate_limit_check($rl_key, 5, 900);
+                $error = $rl['remaining'] > 0
+                    ? "No account found with that username. {$rl['remaining']} attempt(s) remaining."
+                    : 'Too many login attempts. Please try again in 15 minutes.';
+                audit_log($conn, 'admin.login_failed', ['username' => $username]);
             }
+            $stmt->close();
         }
     }
 }
 
-// FIXED: Generate CSRF token for form
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-}
-$csrf_token = $_SESSION['csrf_token'];
+/* ---------- CSRF for the form ---------- */
+$csrf_token = csrf_token();
 
-// FIXED: Clear old error if returning to page
 if (isset($_GET['timeout'])) {
-    $error = "Your session has expired. Please login again.";
+    $error = 'Your session has expired. Please login again.';
 }
 ?>
 
@@ -277,11 +221,11 @@ if (isset($_GET['timeout'])) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin Login • USAT College Sagay City</title>
-    
+
     <!-- Security Headers -->
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="robots" content="noindex, nofollow">
-    
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&family=Playfair+Display:wght@700;800&display=swap" rel="stylesheet">
@@ -348,12 +292,11 @@ if (isset($_GET['timeout'])) {
             100% { background-position: 0% 50%; }
         }
 
-        /* Enhanced background effects */
         body::before {
             content: '';
             position: fixed;
             inset: 0;
-            background: 
+            background:
                 radial-gradient(circle at 20% 30%, rgba(255,255,255,0.15) 0%, transparent 50%),
                 radial-gradient(circle at 80% 70%, rgba(212,175,55,0.12) 0%, transparent 50%),
                 radial-gradient(circle at 40% 80%, rgba(147,197,253,0.1) 0%, transparent 60%);
@@ -361,7 +304,6 @@ if (isset($_GET['timeout'])) {
             z-index: 1;
         }
 
-        /* Animated particles */
         .particles {
             position: fixed;
             inset: 0;
@@ -407,7 +349,6 @@ if (isset($_GET['timeout'])) {
             box-shadow: 0 25px 60px rgba(30, 58, 138, 0.6);
         }
 
-        /* Left Side - Branding */
         .left-side {
             flex: 1;
             background: linear-gradient(135deg, var(--primary-dark), var(--primary));
@@ -487,7 +428,6 @@ if (isset($_GET['timeout'])) {
             z-index: 1;
         }
 
-        /* Right Side - Login Form */
         .right-side {
             flex: 1.15;
             padding: 4rem 4.5rem;
@@ -512,7 +452,6 @@ if (isset($_GET['timeout'])) {
             font-size: 1.1rem;
         }
 
-        /* Error Message */
         .error {
             background: linear-gradient(135deg, #fef2f2, #fee2e2);
             color: #991b1b;
@@ -539,7 +478,6 @@ if (isset($_GET['timeout'])) {
             flex-shrink: 0;
         }
 
-        /* Form Elements */
         .form-group {
             position: relative;
             margin-bottom: 2rem;
@@ -614,7 +552,6 @@ if (isset($_GET['timeout'])) {
             color: var(--primary);
         }
 
-        /* Password Toggle */
         .password-wrapper {
             position: relative;
         }
@@ -638,7 +575,6 @@ if (isset($_GET['timeout'])) {
             color: var(--primary);
         }
 
-        /* Options */
         .options {
             display: flex;
             justify-content: space-between;
@@ -680,7 +616,6 @@ if (isset($_GET['timeout'])) {
             text-decoration: underline;
         }
 
-        /* Login Button */
         .btn-login {
             width: 100%;
             padding: 1.5rem;
@@ -731,7 +666,6 @@ if (isset($_GET['timeout'])) {
             transform: none;
         }
 
-        /* Links */
         .student-link {
             margin-top: 2rem;
             text-align: center;
@@ -763,7 +697,6 @@ if (isset($_GET['timeout'])) {
             font-size: 0.95rem;
         }
 
-        /* Theme Toggle */
         .theme-toggle {
             position: fixed;
             top: 2rem;
@@ -789,7 +722,6 @@ if (isset($_GET['timeout'])) {
             transform: scale(1.1) rotate(15deg);
         }
 
-        /* Loading Spinner */
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
@@ -798,7 +730,6 @@ if (isset($_GET['timeout'])) {
             animation: spin 1s linear infinite;
         }
 
-        /* Responsive */
         @media (max-width: 860px) {
             .login-card {
                 flex-direction: column;
@@ -842,10 +773,8 @@ if (isset($_GET['timeout'])) {
 </head>
 <body>
 
-<!-- Animated Particles -->
 <div class="particles" id="particles"></div>
 
-<!-- Theme Toggle -->
 <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">
     <i class="fas fa-moon"></i>
 </button>
@@ -853,10 +782,9 @@ if (isset($_GET['timeout'])) {
 <div class="login-container">
     <div class="login-card">
 
-        <!-- Left Side: Branding -->
         <div class="left-side">
             <div class="logo-wrapper">
-                <img src="../assets/img/usat.jpg" alt="USAT College Seal" class="logo" 
+                <img src="../assets/img/usat.jpg" alt="USAT College Seal" class="logo"
                      onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22160%22 height=%22160%22><rect fill=%22%234a90d9%22 width=%22160%22 height=%22160%22 rx=%2280%22/><text fill=%22white%22 font-size=%2260%22 x=%2250%25%22 y=%2255%25%22 text-anchor=%22middle%22 dy=%22.3em%22>USAT</text></svg>'">
             </div>
             <h1>Admin Portal</h1>
@@ -864,7 +792,6 @@ if (isset($_GET['timeout'])) {
             <p class="subtitle">Enrollment Profiling System</p>
         </div>
 
-        <!-- Right Side: Login Form -->
         <div class="right-side">
             <?php if ($error): ?>
                 <div class="error" role="alert">
@@ -879,16 +806,15 @@ if (isset($_GET['timeout'])) {
             </div>
 
             <form method="POST" id="loginForm" autocomplete="off" novalidate>
-                <!-- CSRF Token -->
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token, ENT_QUOTES, 'UTF-8') ?>">
-                
+
                 <div class="form-group">
                     <i class="fas fa-user icon"></i>
-                    <input type="text" 
-                           id="username" 
-                           name="username" 
-                           placeholder=" " 
-                           required 
+                    <input type="text"
+                           id="username"
+                           name="username"
+                           placeholder=" "
+                           required
                            autofocus
                            autocomplete="username"
                            maxlength="50"
@@ -898,10 +824,10 @@ if (isset($_GET['timeout'])) {
 
                 <div class="form-group password-wrapper">
                     <i class="fas fa-lock icon"></i>
-                    <input type="password" 
-                           id="password" 
-                           name="password" 
-                           placeholder=" " 
+                    <input type="password"
+                           id="password"
+                           name="password"
+                           placeholder=" "
                            required
                            autocomplete="current-password"
                            minlength="6"
@@ -942,11 +868,10 @@ if (isset($_GET['timeout'])) {
 </div>
 
 <script>
-// Initialize particles
 (function() {
     const container = document.getElementById('particles');
     if (!container) return;
-    
+
     for (let i = 0; i < 20; i++) {
         const particle = document.createElement('div');
         particle.className = 'particle';
@@ -961,17 +886,15 @@ if (isset($_GET['timeout'])) {
     }
 })();
 
-// Theme Management
 (function() {
     const html = document.documentElement;
     const toggleBtn = document.getElementById('themeToggle');
     const icon = toggleBtn.querySelector('i');
-    
-    // Load saved theme
+
     const savedTheme = localStorage.getItem('admin_theme') || 'light';
     html.setAttribute('data-theme', savedTheme);
     updateThemeIcon(savedTheme);
-    
+
     toggleBtn.addEventListener('click', () => {
         const current = html.getAttribute('data-theme') || 'light';
         const newTheme = current === 'dark' ? 'light' : 'dark';
@@ -979,19 +902,18 @@ if (isset($_GET['timeout'])) {
         localStorage.setItem('admin_theme', newTheme);
         updateThemeIcon(newTheme);
     });
-    
+
     function updateThemeIcon(theme) {
         icon.className = theme === 'dark' ? 'fas fa-sun' : 'fas fa-moon';
         toggleBtn.setAttribute('aria-label', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
     }
 })();
 
-// Password Toggle
 (function() {
     const passwordInput = document.getElementById('password');
     const toggleBtn = document.getElementById('togglePassword');
     const icon = toggleBtn.querySelector('i');
-    
+
     toggleBtn.addEventListener('click', () => {
         const isPassword = passwordInput.type === 'password';
         passwordInput.type = isPassword ? 'text' : 'password';
@@ -1001,29 +923,25 @@ if (isset($_GET['timeout'])) {
     });
 })();
 
-// Form Submission with Loading State
 (function() {
     const form = document.getElementById('loginForm');
     const submitBtn = document.getElementById('submitBtn');
     const btnText = submitBtn.querySelector('span');
     const btnIcon = submitBtn.querySelector('i');
-    
+
     form.addEventListener('submit', function(e) {
-        // Basic client-side validation
         const username = document.getElementById('username').value.trim();
         const password = document.getElementById('password').value;
-        
+
         if (!username || !password) {
             e.preventDefault();
             return;
         }
-        
-        // Disable button and show loading state
+
         submitBtn.disabled = true;
         btnIcon.className = 'fas fa-spinner fa-spin';
         btnText.textContent = 'Authenticating...';
-        
-        // Re-enable after 30 seconds if something goes wrong
+
         setTimeout(() => {
             if (submitBtn.disabled) {
                 submitBtn.disabled = false;
@@ -1034,7 +952,6 @@ if (isset($_GET['timeout'])) {
     });
 })();
 
-// Auto-focus username field if empty
 document.addEventListener('DOMContentLoaded', () => {
     const usernameInput = document.getElementById('username');
     if (usernameInput && !usernameInput.value) {
@@ -1042,7 +959,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 
-// Prevent form resubmission on page refresh
 if (window.history.replaceState) {
     window.history.replaceState(null, null, window.location.href);
 }

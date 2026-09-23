@@ -1,9 +1,5 @@
 <?php
-session_start();
-include __DIR__ . "/../config/db.php";
-require_once __DIR__ . "/../config/paths.php";
-
-if (!isset($_SESSION['admin_id'])) { http_response_code(403); die("Forbidden"); }
+require_once __DIR__ . '/../config/auth.php';
 
 $sid = (int)($_GET['id'] ?? 0);
 if ($sid <= 0) { http_response_code(400); die("Bad request"); }

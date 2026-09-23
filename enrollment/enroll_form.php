@@ -168,10 +168,8 @@ $fields = [
     'is_4ps' => ['required' => true]
 ];
 
-// ── NEW HELPERS ──────────────────────────────────────────────────────
 /**
  * Delete staged upload files older than 2 hours.
- * Cheap garbage collection — runs on every POST.
  */
 function purge_old_staging(): void
 {
@@ -186,7 +184,6 @@ function purge_old_staging(): void
 
 /**
  * Move an uploaded file into the staging directory.
- * Returns metadata array on success, null on failure ($err is populated).
  */
 function stage_file(string $tmp_path, string $orig_name, string $label, ?string &$err = null): ?array
 {
@@ -226,7 +223,7 @@ function stage_file(string $tmp_path, string $orig_name, string $label, ?string 
 }
 
 /**
- * Stage raw bytes (for camera captures). Same shape as stage_file().
+ * Stage raw bytes (for camera captures).
  */
 function stage_bytes(string $bin, string $label, string $orig_name, ?string &$err = null): ?array
 {
@@ -270,7 +267,7 @@ function stage_bytes(string $bin, string $label, string $orig_name, ?string &$er
     ];
 }
 
-// ── DOCUMENT OPTIONS (moved up so POST handler can use it) ───────────
+// Document options
 $doc_options = [
     'Good Moral Certificate' => 'good_moral',
     'Junior High School Certificate (Original)' => 'jhs_certificate',
@@ -279,7 +276,7 @@ $doc_options = [
 ];
 
 // ------------------------------------------------------------------
-// POST handling with CSRF validation and file processing
+// POST handling
 // ------------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     purge_old_staging();
@@ -304,7 +301,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // ── Server-side age recompute (never trust the client value)
+    // Server-side age recompute
     if (!empty($_POST['birth_date'])) {
         $birth = DateTime::createFromFormat('Y-m-d', $_POST['birth_date']);
         if (!$birth) {
@@ -332,25 +329,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors['email'] = $t[$lang]['invalid_email'];
     }
 
-    // ── STAGED FILE PROCESSING ───────────────────────────────────────
-    // Session now carries METADATA ONLY — no base64 blobs.
+    // Staged file processing
     $prev = $_SESSION['uploaded_files'] ?? [];
-    $uploaded_files = [];  // keyed by doc_key
+    $uploaded_files = [];
 
     $checked_labels = $_POST['entrance_data'] ?? [];
 
-    // 1) carry forward previously staged files whose docs are still checked
     foreach ($prev as $doc_key => $info) {
         $label = $info['label'] ?? '';
         $path  = $info['staging_path'] ?? '';
         if (in_array($label, $checked_labels, true) && $path !== '' && is_file($path)) {
             $uploaded_files[$doc_key] = $info;
         } elseif ($path !== '' && is_file($path)) {
-            @unlink($path);  // user unchecked it → drop
+            @unlink($path);
         }
     }
 
-    // 2) new uploads from <input type="file" name="entrance_files[doc_key]">
     if (!empty($_FILES['entrance_files']['name']) && is_array($_FILES['entrance_files']['name'])) {
         foreach ($_FILES['entrance_files']['name'] as $doc_key => $name) {
             if ($_FILES['entrance_files']['error'][$doc_key] !== UPLOAD_ERR_OK || $name === '') continue;
@@ -370,7 +364,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // 3) camera captures — <input name="camera_data[doc_key]">
     if (!empty($_POST['camera_data']) && is_array($_POST['camera_data'])) {
         foreach ($_POST['camera_data'] as $doc_key => $data) {
             if (empty($data) || strpos($data, 'data:image/') !== 0) continue;
@@ -403,7 +396,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } else {
         $_SESSION['errors']         = $errors;
         $_SESSION['old']            = $_POST;
-        $_SESSION['uploaded_files'] = $uploaded_files; // keep what we managed to stage
+        $_SESSION['uploaded_files'] = $uploaded_files;
         header('Location: ' . basename(__FILE__));
         exit;
     }
@@ -447,7 +440,6 @@ if (empty($edu_history)) {
     $edu_history[] = ['level' => 'Elementary', 'school_name' => '', 'school_address' => '', 'year_completed' => ''];
 }
 
-// ── Metadata only now — no base64 blobs
 $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'] : [];
 ?>
 <!DOCTYPE html>
@@ -497,7 +489,6 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
         .lang-btn{padding:0.5rem 1rem;border:none;background:none;font-weight:600;transition:all 0.3s ease;border-radius:50px}
         .lang-btn.active{background:#1e88e5;color:white}
 
-        /* === Enhanced error states === */
         .form-group.error input,
         .form-group.error select,
         .form-group.error textarea {
@@ -554,7 +545,6 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
             75%     { transform: translateX(4px); }
         }
 
-        /* === Error summary banner === */
         .error-banner {
             background: linear-gradient(135deg, #fef2f2, #fee2e2);
             border-left: 5px solid #dc3545;
@@ -587,7 +577,6 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
         }
         .error-banner li { margin-bottom: 0.15rem; }
 
-        /* === Progress indicator === */
         .progress-indicator {
             display: flex;
             justify-content: space-between;
@@ -648,7 +637,6 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
             .progress-step .step-number { width: 32px; height: 32px; font-size: 0.85rem; }
         }
 
-        /* === File upload rows === */
         .upload-row {
             background: linear-gradient(135deg, #f8fafc, #f1f5f9);
             border: 2px solid #e2e8f0;
@@ -682,7 +670,6 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
         .doc-upload-row{display:none; margin-top:0.5rem; padding-left:1rem; border-left:3px solid #0d6efd;}
         .doc-upload-row.visible{display:block;}
 
-        /* === SweetAlert overrides === */
         .swal2-popup {
             border-radius: 20px !important;
             padding: 2rem 1.5rem !important;
@@ -770,7 +757,34 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
                     <div class="col-md-4 form-group"><input type="number" id="age" name="age" placeholder=" " value="<?= htmlspecialchars($_POST['age'] ?? '') ?>" min="14" max="25" readonly style="background:#f8f9fa"><label><i class="fas fa-birthday-cake me-1"></i> <?= $t[$lang]['age'] ?></label></div>
                     <div class="col-md-3 form-group"><input type="text" name="civil_status" id="civil_status" placeholder=" " value="<?= htmlspecialchars($_POST['civil_status'] ?? '') ?>"><label><i class="fas fa-ring me-1"></i> <?= $t[$lang]['civil'] ?></label></div>
                     <div class="col-md-3 form-group"><input type="text" name="nationality" id="nationality" placeholder=" " value="<?= htmlspecialchars($_POST['nationality'] ?? '') ?>"><label><i class="fas fa-flag me-1"></i> <?= $t[$lang]['nation'] ?></label></div>
-                    <div class="col-md-3 form-group"><input type="text" name="religion" id="religion" placeholder=" " value="<?= htmlspecialchars($_POST['religion'] ?? '') ?>"><label><i class="fas fa-church me-1"></i> <?= $t[$lang]['religion'] ?></label></div>
+
+                    <!-- Religion with dropdown -->
+                    <div class="col-md-3 form-group">
+                        <input type="text"
+                               name="religion"
+                               id="religion"
+                               placeholder=" "
+                               list="religionOptions"
+                               autocomplete="off"
+                               value="<?= htmlspecialchars($_POST['religion'] ?? '') ?>">
+                        <label><i class="fas fa-church me-1"></i> <?= $t[$lang]['religion'] ?></label>
+                        <datalist id="religionOptions">
+                            <option value="Roman Catholic">
+                            <option value="Islam">
+                            <option value="Iglesia ni Cristo">
+                            <option value="Protestant">
+                            <option value="Born Again Christian">
+                            <option value="Seventh-Day Adventist">
+                            <option value="Jehovah's Witnesses">
+                            <option value="Bible Baptist">
+                            <option value="Mormon (LDS)">
+                            <option value="Buddhism">
+                            <option value="Hinduism">
+                            <option value="Atheist">
+                            <option value="Others">
+                        </datalist>
+                    </div>
+
                     <div class="col-md-3 form-group"><input type="number" step="0.01" name="height" id="height" placeholder=" " value="<?= htmlspecialchars($_POST['height'] ?? '') ?>"><label><i class="fas fa-arrow-up me-1"></i> <?= $t[$lang]['height'] ?></label></div>
                     <div class="col-md-3 form-group"><input type="number" step="0.01" name="weight" id="weight" placeholder=" " value="<?= htmlspecialchars($_POST['weight'] ?? '') ?>"><label><i class="fas fa-weight-hanging me-1"></i> <?= $t[$lang]['weight'] ?></label></div>
                     <div class="col-md-5 form-group <?= isset($errors['email']) ? 'error' : '' ?>"><input type="email" name="email" id="email" placeholder=" " value="<?= htmlspecialchars($_POST['email'] ?? '') ?>"><label><i class="fas fa-envelope me-1"></i> <?= $t[$lang]['email'] ?></label></div>
@@ -1151,7 +1165,6 @@ $display_files = isset($_SESSION['uploaded_files']) ? $_SESSION['uploaded_files'
             <form method="POST" action="process_enroll.php" class="text-center mt-5">
                 <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
                 <?php
-                // Skip nested/internal keys — no blobs posted; staging paths stay server-side.
                 $skip_keys = ['existing_file', 'keep_existing_file', 'camera_data', 'entrance_files'];
                 foreach ($_POST as $k => $v):
                     if (in_array($k, $skip_keys, true)) continue;

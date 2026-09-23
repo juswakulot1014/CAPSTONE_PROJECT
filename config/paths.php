@@ -1,5 +1,12 @@
 <?php
 // config/paths.php
+//
+// Loads .env, defines storage constants, validates the encryption key,
+// and provides path helpers used throughout the app.
+//
+// IMPORTANT: This file must NOT require bootstrap.php.
+// The dependency is one-way: bootstrap.php → paths.php.
+// Adding a require here creates a circular include loop.
 
 // ────────────────────────────────────────────────
 // Load .env from project root (simple parser, no library)
@@ -11,7 +18,7 @@ if (is_readable($envFile)) {
         $line = trim($line);
         if ($line === '' || $line[0] === '#') continue;
         if (strpos($line, '=') === false) continue;
-        list($k, $v) = explode('=', $line, 2);
+        [$k, $v] = explode('=', $line, 2);
         $k = trim($k);
         $v = trim($v);
         if (strlen($v) >= 2 && ($v[0] === '"' || $v[0] === "'") && $v[0] === substr($v, -1)) {
@@ -28,14 +35,35 @@ if (is_readable($envFile)) {
 // ────────────────────────────────────────────────
 // Storage layout
 // ────────────────────────────────────────────────
-define('STORAGE_DIR',        dirname(__DIR__, 2) . '/storage');
-define('DOCUMENTS_DIR',      STORAGE_DIR . '/documents/');
-define('STUDENTS_PHOTO_DIR', STORAGE_DIR . '/students/');
-define('STAGING_DIR',        STORAGE_DIR . '/staging/');
+$storageRoot = getenv('STORAGE_ROOT');
+if ($storageRoot === false || $storageRoot === '') {
+    // config/ → project/ → htdocs/ → parent-of-htdocs/
+    $storageRoot = dirname(__DIR__, 3) . DIRECTORY_SEPARATOR . 'enrollment_storage';
+}
+define('STORAGE_DIR', rtrim($storageRoot, '/\\'));
+
+define('DOCUMENTS_DIR',      STORAGE_DIR . DIRECTORY_SEPARATOR . 'documents' . DIRECTORY_SEPARATOR);
+define('STUDENTS_PHOTO_DIR', STORAGE_DIR . DIRECTORY_SEPARATOR . 'students'  . DIRECTORY_SEPARATOR);
+define('STAGING_DIR',        STORAGE_DIR . DIRECTORY_SEPARATOR . 'staging'   . DIRECTORY_SEPARATOR);
 
 foreach ([DOCUMENTS_DIR, STUDENTS_PHOTO_DIR, STAGING_DIR] as $d) {
-    if (!is_dir($d) && !mkdir($d, 0700, true) && !is_dir($d)) {
-        throw new RuntimeException("Cannot create {$d}");
+    if (!is_dir($d)) {
+        if (!@mkdir($d, 0700, true) && !is_dir($d)) {
+            throw new RuntimeException("Cannot create storage directory: {$d}");
+        }
+    }
+}
+
+// Guard: refuse to run if storage ended up inside the webroot.
+$docRoot     = realpath($_SERVER['DOCUMENT_ROOT'] ?? '');
+$storageReal = realpath(STORAGE_DIR);
+if ($docRoot !== false && $storageReal !== false) {
+    if (str_starts_with($storageReal, $docRoot . DIRECTORY_SEPARATOR)
+        || $storageReal === $docRoot) {
+        throw new RuntimeException(
+            "SECURITY: STORAGE_DIR is inside the webroot ({$storageReal}). "
+          . "Move it outside htdocs, or set STORAGE_ROOT in .env."
+        );
     }
 }
 
@@ -44,7 +72,10 @@ foreach ([DOCUMENTS_DIR, STUDENTS_PHOTO_DIR, STAGING_DIR] as $d) {
 // ────────────────────────────────────────────────
 $encKey = getenv('DOC_ENC_KEY');
 if (!$encKey || strlen($encKey) !== 64 || !ctype_xdigit($encKey)) {
-    throw new RuntimeException('DOC_ENC_KEY env var missing or invalid (need 64 hex chars).');
+    throw new RuntimeException(
+        'DOC_ENC_KEY env var missing or invalid (need 64 hex chars). '
+      . 'Generate one with: php -r "echo bin2hex(random_bytes(32));"'
+    );
 }
 define('DOC_ENC_KEY', $encKey);
 

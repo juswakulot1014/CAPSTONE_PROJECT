@@ -1,17 +1,7 @@
 <?php
-// Start session only if not already active
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
-
-// Include database only once
-include_once __DIR__ . "/../config/db.php";
-require_once __DIR__ . "/../config/paths.php";
-
-if (!isset($_SESSION['admin_id'])) {
-    header("Location: admin_login.php");
-    exit();
-}
+require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/audit.php';
+require_once __DIR__ . '/../config/crypto.php';
 
 // ==================== REQUIRED DOCUMENTS CONFIG ====================
 $REQUIRED_DOCS = [
@@ -40,13 +30,11 @@ function getTerms(): array {
 function docKey($s): string {
     $s = strtolower(trim((string)$s));
     $s = str_replace('.', '', $s);
-    $s = preg_replace('/\s+/', ' ', $s);
-    return $s;
+    return preg_replace('/\s+/', ' ', $s);
 }
 
 /**
  * Build display name: LastName, FirstName MiddleName Ext.
- * Example: "Pable, Joshua Aquino"  or  "Pable, Joshua Aquino Jr."
  */
 function formatStudentName(array $s): string {
     $mn  = !empty($s['middle_name']) ? ' ' . trim($s['middle_name']) : '';
@@ -59,6 +47,51 @@ function statSizeClass($val) {
     if ($len > 30) return 'xs';
     if ($len > 14) return 'sm';
     return '';
+}
+
+/**
+ * Encrypt and store a document file.
+ * Returns metadata array on success. Throws on failure.
+ */
+function store_encrypted_document(string $tmp_path, int $student_id, int $entrance_id): array {
+    if (!is_file($tmp_path)) {
+        throw new Exception('Uploaded file missing.');
+    }
+    $size = filesize($tmp_path);
+    if ($size === false || $size === 0) throw new Exception('Empty file.');
+    if ($size > 5 * 1024 * 1024)        throw new Exception('File too large (max 5 MB).');
+
+    $fi = finfo_open(FILEINFO_MIME_TYPE);
+    $mime = finfo_file($fi, $tmp_path);
+    finfo_close($fi);
+
+    $allowed = [
+        'application/pdf' => 'pdf',
+        'image/jpeg'      => 'jpg',
+        'image/png'       => 'png',
+    ];
+    if (!isset($allowed[$mime])) {
+        throw new Exception('Unsupported file type. Allowed: PDF, JPG, PNG.');
+    }
+
+    $plain = file_get_contents($tmp_path);
+    if ($plain === false || $plain === '') throw new Exception('Cannot read file.');
+
+    $blob  = doc_encrypt($plain);
+    $token = bin2hex(random_bytes(16));
+    $stored_name = "doc_{$student_id}_{$entrance_id}_{$token}.{$allowed[$mime]}.enc";
+    $abs = DOCUMENTS_DIR . $stored_name;
+
+    if (file_put_contents($abs, $blob, LOCK_EX) === false) {
+        throw new Exception('Storage write failed.');
+    }
+    @chmod($abs, 0600);
+
+    return [
+        'filename' => $stored_name,
+        'mime'     => $mime,
+        'size'     => $size,
+    ];
 }
 
 // ==================== WORD EXPORT ====================
@@ -130,213 +163,477 @@ if ($export_word) {
 }
 
 // ====================== HANDLERS ======================
+
+// --- Upload document (encrypted) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_document'])) {
-    $eid=(int)$_POST['entrance_id']; $sid=(int)$_POST['student_id'];
-    if(isset($_FILES['document_file'])&&$_FILES['document_file']['error']===0){
-        $ext=strtolower(pathinfo($_FILES['document_file']['name'],PATHINFO_EXTENSION));
-        $allowed_ext=['pdf','jpg','jpeg','png','doc','docx'];
-        $allowed_mime=[
-            'application/pdf',
-            'image/jpeg',
-            'image/png',
-            'application/msword',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        ];
-        $max_bytes = 5 * 1024 * 1024;
+    verify_csrf();
 
-        $finfo = finfo_open(FILEINFO_MIME_TYPE);
-        $mime  = finfo_file($finfo, $_FILES['document_file']['tmp_name']);
-        finfo_close($finfo);
+    $eid = (int)($_POST['entrance_id'] ?? 0);
+    $sid = (int)($_POST['student_id'] ?? 0);
 
-        if(!in_array($ext, $allowed_ext, true)){
-            $_SESSION['error']="Invalid file type.";
-        } elseif(!in_array($mime, $allowed_mime, true)){
-            $_SESSION['error']="Invalid file content (MIME mismatch).";
-        } elseif($_FILES['document_file']['size'] > $max_bytes){
-            $_SESSION['error']="File too large (max 5 MB).";
-        } else {
-            $dir = DOCUMENTS_DIR;
-            if(!is_dir($dir)) mkdir($dir, 0755, true);
-            $fn = "doc_{$sid}_{$eid}_" . time() . "." . $ext;
-            $tp = $dir . $fn;
-            $dp = $fn;
-
-            if(move_uploaded_file($_FILES['document_file']['tmp_name'], $tp)){
-                $orig_name = $_FILES['document_file']['name'];
-                $s=$conn->prepare("UPDATE entrance_documents SET submitted=1,file_path=?,file_name=?,file_mime=?,file_data=NULL,uploaded_by=?,uploaded_at=NOW() WHERE entrance_id=? AND student_id=?");
-                $s->bind_param("sssiii",$dp,$orig_name,$mime,$_SESSION['admin_id'],$eid,$sid);
-                $s->execute() ? $_SESSION['success']="Document uploaded!" : $_SESSION['error']="DB error.";
-                $s->close();
-            } else {
-                $_SESSION['error']="File save failed.";
-            }
-        }
-    } else {
-        $_SESSION['error']="No file selected.";
+    if ($eid <= 0 || $sid <= 0) {
+        $_SESSION['error'] = 'Invalid document or student.';
+        header("Location: view_student.php?id=$sid"); exit();
     }
+
+    // Ownership check
+    $chk = $conn->prepare("SELECT entrance_id, file_path FROM entrance_documents WHERE entrance_id = ? AND student_id = ? LIMIT 1");
+    $chk->bind_param("ii", $eid, $sid);
+    $chk->execute();
+    $doc = $chk->get_result()->fetch_assoc();
+    $chk->close();
+
+    if (!$doc) {
+        $_SESSION['error'] = 'Document not found for this student.';
+        header("Location: view_student.php?id=$sid"); exit();
+    }
+
+    $f = $_FILES['document_file'] ?? null;
+    if (!$f || ($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {
+        $_SESSION['error'] = 'No file uploaded.';
+        header("Location: view_student.php?id=$sid"); exit();
+    }
+
+    try {
+        $stored = store_encrypted_document($f['tmp_name'], $sid, $eid);
+
+        // Delete previous encrypted file if any
+        if (!empty($doc['file_path'])) {
+            $old = DOCUMENTS_DIR . basename($doc['file_path']);
+            if (is_file($old)) @unlink($old);
+        }
+
+        $safe_name = preg_replace('/[^A-Za-z0-9._\- ]/', '_', basename((string)$f['name']));
+        if ($safe_name === '' || $safe_name === null) $safe_name = 'document';
+        $safe_name = mb_substr($safe_name, 0, 200);
+
+        $upd = $conn->prepare("
+            UPDATE entrance_documents
+            SET submitted = 1, file_path = ?, file_mime = ?, file_name = ?,
+                file_data = NULL, uploaded_by = ?, uploaded_at = NOW()
+            WHERE entrance_id = ? AND student_id = ?
+        ");
+        $upd->bind_param("sssiii",
+            $stored['filename'], $stored['mime'], $safe_name,
+            $_SESSION['admin_id'], $eid, $sid);
+        $upd->execute();
+        $upd->close();
+
+        audit_log($conn, 'document.upload', [
+            'type'       => 'document',
+            'id'         => $eid,
+            'student_id' => $sid,
+        ]);
+
+        $_SESSION['success'] = 'Document uploaded and encrypted.';
+    } catch (Exception $e) {
+        error_log('view_student upload: ' . $e->getMessage());
+        $_SESSION['error'] = $e->getMessage();
+    }
+
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Delete document ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_document'])) {
-    $eid=(int)$_POST['entrance_id']; $sid=(int)$_POST['student_id'];
-    $s=$conn->prepare("SELECT file_path FROM entrance_documents WHERE entrance_id=? AND student_id=?");
-    $s->bind_param("ii",$eid,$sid); $s->execute(); $r=$s->get_result()->fetch_assoc(); $s->close();
+    verify_csrf();
 
-    if($r && !empty($r['file_path'])){
-        $p = document_abs_path($r['file_path']);
-        if(file_exists($p)) @unlink($p);
+    $eid = (int)($_POST['entrance_id'] ?? 0);
+    $sid = (int)($_POST['student_id'] ?? 0);
+
+    $chk = $conn->prepare("SELECT file_path FROM entrance_documents WHERE entrance_id = ? AND student_id = ?");
+    $chk->bind_param("ii", $eid, $sid);
+    $chk->execute();
+    $row = $chk->get_result()->fetch_assoc();
+    $chk->close();
+
+    if ($row && !empty($row['file_path'])) {
+        $abs  = DOCUMENTS_DIR . basename($row['file_path']);
+        $root = realpath(DOCUMENTS_DIR);
+        $real = realpath($abs);
+        if ($real && $root && str_starts_with($real, $root . DIRECTORY_SEPARATOR)) {
+            @unlink($real);
+        }
     }
-    $s=$conn->prepare("UPDATE entrance_documents SET submitted=0,file_path=NULL,file_name=NULL,file_mime=NULL,file_data=NULL,uploaded_by=NULL,uploaded_at=NULL WHERE entrance_id=? AND student_id=?");
-    $s->bind_param("ii",$eid,$sid); $s->execute(); $s->close();
-    $_SESSION['success']="Document removed!"; header("Location: view_student.php?id=$sid"); exit();
-}
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_photo'])) {
-    $sid=(int)$_POST['student_id'];
-    if(isset($_FILES['student_photo'])&&$_FILES['student_photo']['error']===0){
-        $ext=strtolower(pathinfo($_FILES['student_photo']['name'],PATHINFO_EXTENSION));
-        if(in_array($ext,['jpg','jpeg','png'])){
-            $dir = STUDENTS_PHOTO_DIR;
-            if(!is_dir($dir)) mkdir($dir, 0755, true);
 
-            $oldq = $conn->prepare("SELECT photo FROM students_info WHERE student_id=?");
-            $oldq->bind_param("i", $sid); $oldq->execute();
-            $oldrow = $oldq->get_result()->fetch_assoc(); $oldq->close();
-            if(!empty($oldrow['photo'])){
-                $oldabs = student_photo_abs_path($oldrow['photo']);
-                if(file_exists($oldabs)) @unlink($oldabs);
+    $upd = $conn->prepare("
+        UPDATE entrance_documents
+        SET submitted = 0, file_path = NULL, file_mime = NULL, file_name = NULL,
+            file_data = NULL, uploaded_by = NULL, uploaded_at = NULL
+        WHERE entrance_id = ? AND student_id = ?
+    ");
+    $upd->bind_param("ii", $eid, $sid);
+    $upd->execute();
+    $upd->close();
+
+    audit_log($conn, 'document.delete', [
+        'type'       => 'document',
+        'id'         => $eid,
+        'student_id' => $sid,
+    ]);
+
+    $_SESSION['success'] = 'Document removed.';
+    header("Location: view_student.php?id=$sid"); exit();
+}
+
+// --- Upload student photo ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['upload_photo'])) {
+    verify_csrf();
+
+    $sid = (int)$_POST['student_id'];
+
+    if (isset($_FILES['student_photo']) && $_FILES['student_photo']['error'] === 0) {
+        $ext = strtolower(pathinfo($_FILES['student_photo']['name'], PATHINFO_EXTENSION));
+        $fi  = finfo_open(FILEINFO_MIME_TYPE);
+        $mime = finfo_file($fi, $_FILES['student_photo']['tmp_name']);
+        finfo_close($fi);
+
+        if (in_array($mime, ['image/jpeg', 'image/png'], true)
+            && $_FILES['student_photo']['size'] <= 2 * 1024 * 1024) {
+
+            $dir = STUDENTS_PHOTO_DIR;
+            if (!is_dir($dir)) mkdir($dir, 0750, true);
+
+            // Delete old photo
+            $oq = $conn->prepare("SELECT photo FROM students_info WHERE student_id = ?");
+            $oq->bind_param("i", $sid);
+            $oq->execute();
+            $old = $oq->get_result()->fetch_assoc();
+            $oq->close();
+            if (!empty($old['photo'])) {
+                $oabs = student_photo_abs_path($old['photo']);
+                if (is_file($oabs)) @unlink($oabs);
             }
 
-            $fn = "student_{$sid}_" . time() . ".$ext";
-            if(move_uploaded_file($_FILES['student_photo']['tmp_name'], $dir . $fn)){
-                $s=$conn->prepare("UPDATE students_info SET photo=? WHERE student_id=?");
-                $s->bind_param("si",$fn,$sid); $s->execute(); $s->close();
-                $_SESSION['success']="Photo updated!";
+            $fn = "student_{$sid}_" . time() . ".{$ext}";
+                        if (move_uploaded_file($_FILES['student_photo']['tmp_name'], $dir . $fn)) {
+                @chmod($dir . $fn, 0640);
+                $s = $conn->prepare("UPDATE students_info SET photo = ? WHERE student_id = ?");
+                $s->bind_param("si", $fn, $sid);
+                $s->execute();
+                $s->close();
+
+                audit_log($conn, 'student.photo_update', [
+                    'type'       => 'student',
+                    'id'         => $sid,
+                    'filename'   => $fn,
+                ]);
+
+                $_SESSION['success'] = 'Photo updated.';
             } else {
-                $_SESSION['error']="Save failed.";
+                $_SESSION['error'] = 'Photo save failed.';
             }
         } else {
-            $_SESSION['error']="JPG/PNG only.";
+            $_SESSION['error'] = 'JPG/PNG under 2 MB only.';
         }
     } else {
-        $_SESSION['error']="No file.";
+        $_SESSION['error'] = 'No file.';
     }
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Delete student (with file cleanup) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_student'])) {
-    $sid=(int)$_POST['student_id'];
+    verify_csrf();
+
+    $sid = (int)$_POST['student_id'];
+
+    // Collect file paths BEFORE deleting rows
+    $files = [];
+    $dq = $conn->prepare("SELECT file_path FROM entrance_documents WHERE student_id = ? AND file_path IS NOT NULL");
+    $dq->bind_param("i", $sid);
+    $dq->execute();
+    $dres = $dq->get_result();
+    while ($d = $dres->fetch_assoc()) {
+        if (!empty($d['file_path'])) {
+            $files[] = DOCUMENTS_DIR . basename($d['file_path']);
+        }
+    }
+    $dq->close();
+
+    // Photo path
+    $pq = $conn->prepare("SELECT photo FROM students_info WHERE student_id = ?");
+    $pq->bind_param("i", $sid);
+    $pq->execute();
+    $prow = $pq->get_result()->fetch_assoc();
+    $pq->close();
+    $photo_abs = !empty($prow['photo']) ? student_photo_abs_path($prow['photo']) : null;
+
     $conn->begin_transaction();
-    try{
-        $dq = $conn->prepare("SELECT file_path FROM entrance_documents WHERE student_id=? AND file_path IS NOT NULL");
-        $dq->bind_param("i", $sid); $dq->execute();
-        $dres = $dq->get_result();
-        while($d = $dres->fetch_assoc()){
-            $abs = document_abs_path($d['file_path']);
-            if(file_exists($abs)) @unlink($abs);
+    try {
+        foreach (['student_grades', 'entrance_documents', 'educational_history', 'addresses', 'parents_info', 'enrollment_form'] as $t) {
+            $s = $conn->prepare("DELETE FROM `$t` WHERE student_id = ?");
+            $s->bind_param("i", $sid);
+            $s->execute();
+            $s->close();
         }
-        $dq->close();
-
-        $pq = $conn->prepare("SELECT photo FROM students_info WHERE student_id=?");
-        $pq->bind_param("i", $sid); $pq->execute();
-        $prow = $pq->get_result()->fetch_assoc(); $pq->close();
-        if(!empty($prow['photo'])){
-            $pabs = student_photo_abs_path($prow['photo']);
-            if(file_exists($pabs)) @unlink($pabs);
-        }
-
-        foreach(['student_grades','entrance_documents','educational_history','addresses','parents_info','enrollment_form'] as $t){
-            $s=$conn->prepare("DELETE FROM `$t` WHERE student_id=?");
-            $s->bind_param("i",$sid); $s->execute(); $s->close();
-        }
-        $s=$conn->prepare("DELETE FROM students_info WHERE student_id=?");
-        $s->bind_param("i",$sid); $s->execute(); $s->close();
+        $s = $conn->prepare("DELETE FROM students_info WHERE student_id = ?");
+        $s->bind_param("i", $sid);
+        $s->execute();
+        $s->close();
         $conn->commit();
-        $_SESSION['success']="Student deleted!";
+
+        // Only unlink after commit succeeds
+        $root = realpath(DOCUMENTS_DIR);
+        foreach ($files as $abs) {
+            $real = realpath($abs);
+            if ($real && $root && str_starts_with($real, $root . DIRECTORY_SEPARATOR)) {
+                @unlink($real);
+            }
+        }
+        if ($photo_abs && is_file($photo_abs)) @unlink($photo_abs);
+
+        audit_log($conn, 'student.delete', ['type' => 'student', 'id' => $sid]);
+        $_SESSION['success'] = 'Student deleted.';
         header("Location: student_profile.php"); exit();
-    } catch(Exception $e){
+    } catch (Exception $e) {
         $conn->rollback();
-        $_SESSION['error']="Failed to delete.";
+        $_SESSION['error'] = 'Delete failed.';
         header("Location: view_student.php?id=$sid"); exit();
     }
 }
+
+// --- Add grade ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_grade'])) {
+    verify_csrf();
+
     $sid  = (int)$_POST['student_id'];
     $term = trim($_POST['term'] ?? '');
     $sc   = trim($_POST['subject_code'] ?? '');
     $sn   = trim($_POST['subject_name'] ?? '');
-    $gr   = !empty($_POST['grade']) ? (float)$_POST['grade'] : null;
+    $gr   = ($_POST['grade'] ?? '') !== '' ? (float)$_POST['grade'] : null;
     $rem  = trim($_POST['remarks'] ?? '');
 
-    if(!in_array($term, getTerms(), true)){
-        $_SESSION['error']="Invalid term selected.";
+    if (!in_array($term, getTerms(), true)) {
+        $_SESSION['error'] = 'Invalid term selected.';
         header("Location: view_student.php?id=$sid"); exit();
     }
 
-    $es=$conn->prepare("SELECT enrollment_id, grade_level, school_year FROM enrollment_form WHERE student_id=? ORDER BY enrollment_id DESC LIMIT 1");
-    $es->bind_param("i",$sid); $es->execute(); $er=$es->get_result()->fetch_assoc(); $es->close();
-    if(!$er){$_SESSION['error']="No enrollment record."; header("Location: view_student.php?id=$sid"); exit();}
+    $es = $conn->prepare("SELECT enrollment_id, grade_level, school_year FROM enrollment_form WHERE student_id = ? ORDER BY enrollment_id DESC LIMIT 1");
+    $es->bind_param("i", $sid);
+    $es->execute();
+    $er = $es->get_result()->fetch_assoc();
+    $es->close();
 
-    if(empty($term)||empty($sc)||empty($sn)){
-        $_SESSION['error']="Fill required fields.";
+    if (!$er) {
+        $_SESSION['error'] = 'No enrollment record — enroll the student first.';
+        header("Location: view_student.php?id=$sid"); exit();
+    }
+
+    if ($term === '' || $sc === '' || $sn === '') {
+        $_SESSION['error'] = 'Fill required fields.';
     } else {
-        $s=$conn->prepare("INSERT INTO student_grades (student_id,enrollment_id,term,grade_level,school_year,subject_code,subject_name,grade,remarks) VALUES (?,?,?,?,?,?,?,?,?)");
-        $s->bind_param("iisssssds",$sid,$er['enrollment_id'],$term,$er['grade_level'],$er['school_year'],$sc,$sn,$gr,$rem);
-        $s->execute() ? $_SESSION['success']="Grade added!" : $_SESSION['error']="Failed to add grade.";
+               $s = $conn->prepare("INSERT INTO student_grades
+            (student_id, enrollment_id, term, grade_level, school_year, subject_code, subject_name, grade, remarks)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        $s->bind_param("iisssssds",
+            $sid, $er['enrollment_id'], $term,
+            $er['grade_level'], $er['school_year'],
+            $sc, $sn, $gr, $rem);
+
+        if ($s->execute()) {
+            audit_log($conn, 'grade.create', [
+                'type'       => 'grade',
+                'id'         => $conn->insert_id,
+                'student_id' => $sid,
+                'term'       => $term,
+                'subject'    => $sc,
+                'grade'      => $gr,
+            ]);
+            $_SESSION['success'] = 'Grade added.';
+        } else {
+            $_SESSION['error'] = 'Failed to add grade.';
+        }
         $s->close();
     }
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Edit grade ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_grade'])) {
+    verify_csrf();
+
     $gid  = (int)$_POST['grade_id'];
     $sid  = (int)$_POST['student_id'];
     $term = trim($_POST['term'] ?? '');
     $sc   = trim($_POST['subject_code'] ?? '');
     $sn   = trim($_POST['subject_name'] ?? '');
-    $gr   = !empty($_POST['grade']) ? (float)$_POST['grade'] : null;
+    $gr   = ($_POST['grade'] ?? '') !== '' ? (float)$_POST['grade'] : null;
     $rem  = trim($_POST['remarks'] ?? '');
 
-    if(!in_array($term, getTerms(), true)){
-        $_SESSION['error']="Invalid term selected.";
+    if (!in_array($term, getTerms(), true)) {
+        $_SESSION['error'] = 'Invalid term selected.';
         header("Location: view_student.php?id=$sid"); exit();
     }
 
-    $s=$conn->prepare("UPDATE student_grades SET term=?, subject_code=?, subject_name=?, grade=?, remarks=? WHERE grade_id=? AND student_id=?");
-    $s->bind_param("sssdsii",$term,$sc,$sn,$gr,$rem,$gid,$sid);
-    $s->execute() ? $_SESSION['success']="Grade updated!" : $_SESSION['error']="Failed to update.";
+    // Fetch old values for the diff
+    $old_stmt = $conn->prepare("SELECT term, subject_code, subject_name, grade, remarks
+                                FROM student_grades WHERE grade_id = ? AND student_id = ?");
+    $old_stmt->bind_param("ii", $gid, $sid);
+    $old_stmt->execute();
+    $old_grade = $old_stmt->get_result()->fetch_assoc() ?: [];
+    $old_stmt->close();
+
+    $s = $conn->prepare("UPDATE student_grades SET term=?, subject_code=?, subject_name=?, grade=?, remarks=? WHERE grade_id=? AND student_id=?");
+    $s->bind_param("sssdsii", $term, $sc, $sn, $gr, $rem, $gid, $sid);
+
+    if ($s->execute()) {
+        audit_diff($conn, 'grade.update', $old_grade, [
+            'term'         => $term,
+            'subject_code' => $sc,
+            'subject_name' => $sn,
+            'grade'        => $gr,
+            'remarks'      => $rem,
+        ], 'grade', $gid);
+        $_SESSION['success'] = 'Grade updated.';
+    } else {
+        $_SESSION['error'] = 'Failed to update.';
+    }
     $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Delete grade ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_grade'])) {
-    $gid=(int)$_POST['grade_id']; $sid=(int)$_POST['student_id'];
-    $s=$conn->prepare("DELETE FROM student_grades WHERE grade_id=? AND student_id=?");
-    $s->bind_param("ii",$gid,$sid);
-    $s->execute()?$_SESSION['success']="Grade deleted!":$_SESSION['error']="Failed to delete.";
+    verify_csrf();
+
+    $gid = (int)$_POST['grade_id'];
+    $sid = (int)$_POST['student_id'];
+    // Capture the subject before deletion for the audit trail
+    $lookup = $conn->prepare("SELECT subject_code, subject_name, grade FROM student_grades WHERE grade_id = ? AND student_id = ?");
+    $lookup->bind_param("ii", $gid, $sid);
+    $lookup->execute();
+    $deleted = $lookup->get_result()->fetch_assoc() ?: [];
+    $lookup->close();
+
+    $s = $conn->prepare("DELETE FROM student_grades WHERE grade_id = ? AND student_id = ?");
+    $s->bind_param("ii", $gid, $sid);
+
+    if ($s->execute()) {
+        audit_log($conn, 'grade.delete', [
+            'type'       => 'grade',
+            'id'         => $gid,
+            'student_id' => $sid,
+            'subject'    => $deleted['subject_code'] ?? null,
+            'name'       => $deleted['subject_name'] ?? null,
+            'grade'      => $deleted['grade'] ?? null,
+        ]);
+        $_SESSION['success'] = 'Grade deleted.';
+    } else {
+        $_SESSION['error'] = 'Failed to delete.';
+    }
     $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Add education ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_education'])) {
-    $sid=(int)$_POST['student_id']; $lvl=trim($_POST['level']??''); $schn=trim($_POST['school_name']??''); $scha=trim($_POST['school_address']??''); $yr=trim($_POST['year_completed']??'');
-    if(empty($lvl)||empty($schn)){$_SESSION['error']="Required fields missing.";}else{$s=$conn->prepare("INSERT INTO educational_history (student_id,level,school_name,school_address,year_completed) VALUES (?,?,?,?,?)"); $s->bind_param("issss",$sid,$lvl,$schn,$scha,$yr); $s->execute()?$_SESSION['success']="Education added!":$_SESSION['error']="Failed to add."; $s->close();}
+    verify_csrf();
+
+    $sid  = (int)$_POST['student_id'];
+    $lvl  = trim($_POST['level'] ?? '');
+    $schn = trim($_POST['school_name'] ?? '');
+    $scha = trim($_POST['school_address'] ?? '');
+    $yr   = trim($_POST['year_completed'] ?? '');
+
+    if ($lvl === '' || $schn === '') {
+        $_SESSION['error'] = 'Required fields missing.';
+    } else {
+        $s = $conn->prepare("INSERT INTO educational_history (student_id, level, school_name, school_address, year_completed) VALUES (?, ?, ?, ?, ?)");
+        $s->bind_param("issss", $sid, $lvl, $schn, $scha, $yr);
+
+        if ($s->execute()) {
+            audit_log($conn, 'education.create', [
+                'type'       => 'education',
+                'id'         => $conn->insert_id,
+                'student_id' => $sid,
+                'level'      => $lvl,
+                'school'     => $schn,
+            ]);
+            $_SESSION['success'] = 'Education added.';
+        } else {
+            $_SESSION['error'] = 'Failed to add.';
+        }
+        $s->close();
+    }
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Edit education ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['edit_education'])) {
-    $eid=(int)$_POST['edu_id']; $sid=(int)$_POST['student_id']; $lvl=trim($_POST['level']??''); $schn=trim($_POST['school_name']??''); $scha=trim($_POST['school_address']??''); $yr=trim($_POST['year_completed']??'');
-    $s=$conn->prepare("UPDATE educational_history SET level=?,school_name=?,school_address=?,year_completed=? WHERE edu_id=? AND student_id=?");
-    $s->bind_param("ssssii",$lvl,$schn,$scha,$yr,$eid,$sid);
-    $s->execute()?$_SESSION['success']="Education updated!":$_SESSION['error']="Failed to update.";
+    verify_csrf();
+
+    $eid  = (int)$_POST['edu_id'];
+    $sid  = (int)$_POST['student_id'];
+    $lvl  = trim($_POST['level'] ?? '');
+    $schn = trim($_POST['school_name'] ?? '');
+    $scha = trim($_POST['school_address'] ?? '');
+    $yr   = trim($_POST['year_completed'] ?? '');
+
+    // Fetch old values for the diff
+    $old_stmt = $conn->prepare("SELECT level, school_name, school_address, year_completed
+                                FROM educational_history WHERE edu_id = ? AND student_id = ?");
+    $old_stmt->bind_param("ii", $eid, $sid);
+    $old_stmt->execute();
+    $old_edu = $old_stmt->get_result()->fetch_assoc() ?: [];
+    $old_stmt->close();
+
+    $s = $conn->prepare("UPDATE educational_history SET level=?, school_name=?, school_address=?, year_completed=? WHERE edu_id=? AND student_id=?");
+    $s->bind_param("ssssii", $lvl, $schn, $scha, $yr, $eid, $sid);
+
+    if ($s->execute()) {
+        audit_diff($conn, 'education.update', $old_edu, [
+            'level'          => $lvl,
+            'school_name'    => $schn,
+            'school_address' => $scha,
+            'year_completed' => $yr,
+        ], 'education', $eid);
+        $_SESSION['success'] = 'Education updated.';
+    } else {
+        $_SESSION['error'] = 'Failed to update.';
+    }
     $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
+
+// --- Delete education ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_education'])) {
-    $eid=(int)$_POST['edu_id']; $sid=(int)$_POST['student_id'];
-    $s=$conn->prepare("DELETE FROM educational_history WHERE edu_id=? AND student_id=?");
-    $s->bind_param("ii",$eid,$sid);
-    $s->execute()?$_SESSION['success']="Education deleted!":$_SESSION['error']="Failed to delete.";
+    verify_csrf();
+
+    $eid = (int)$_POST['edu_id'];
+    $sid = (int)$_POST['student_id'];
+    // Capture before deletion
+    $lookup = $conn->prepare("SELECT level, school_name FROM educational_history WHERE edu_id = ? AND student_id = ?");
+    $lookup->bind_param("ii", $eid, $sid);
+    $lookup->execute();
+    $deleted_edu = $lookup->get_result()->fetch_assoc() ?: [];
+    $lookup->close();
+
+    $s = $conn->prepare("DELETE FROM educational_history WHERE edu_id = ? AND student_id = ?");
+    $s->bind_param("ii", $eid, $sid);
+
+    if ($s->execute()) {
+        audit_log($conn, 'education.delete', [
+            'type'       => 'education',
+            'id'         => $eid,
+            'student_id' => $sid,
+            'level'      => $deleted_edu['level'] ?? null,
+            'school'     => $deleted_edu['school_name'] ?? null,
+        ]);
+        $_SESSION['success'] = 'Education deleted.';
+    } else {
+        $_SESSION['error'] = 'Failed to delete.';
+    }
     $s->close();
     header("Location: view_student.php?id=$sid"); exit();
 }
 
 // ====================== FETCH DATA ======================
-if(!isset($_GET['id'])||!is_numeric($_GET['id'])){$_SESSION['error']="No student ID."; header("Location: student_profile.php"); exit();}
-$student_id=(int)$_GET['id'];
+if (!isset($_GET['id']) || !is_numeric($_GET['id'])) {
+    $_SESSION['error'] = 'No student ID.';
+    header("Location: student_profile.php"); exit();
+}
+$student_id = (int)$_GET['id'];
 
 $s = $conn->prepare("
     SELECT s.*,
@@ -363,13 +660,16 @@ $s->execute();
 $student = $s->get_result()->fetch_assoc();
 $s->close();
 
-if (!$student) { $_SESSION['error'] = "Student not found."; header("Location: student_profile.php"); exit(); }
+if (!$student) {
+    $_SESSION['error'] = 'Student not found.';
+    header("Location: student_profile.php"); exit();
+}
 
 $enrollment = !empty($student['enrollment_id']) ? $student : [];
 $parents = $student;
 $address = $student;
 
-// Auto-seed required documents
+// Auto-seed required documents (idempotent)
 $check = $conn->prepare("SELECT entrance_id, document_name FROM entrance_documents WHERE student_id = ?");
 $check->bind_param("i", $student_id);
 $check->execute();
@@ -393,11 +693,14 @@ foreach ($REQUIRED_DOCS as $docName) {
 $insert->close();
 
 // Education
-$s=$conn->prepare("SELECT edu_id,level,school_name,school_address,year_completed FROM educational_history WHERE student_id=? ORDER BY CASE level WHEN 'Elementary' THEN 1 WHEN 'JHS' THEN 2 ELSE 3 END");
-$s->bind_param("i",$student_id); $s->execute(); $education=$s->get_result()->fetch_all(MYSQLI_ASSOC); $s->close();
+$s = $conn->prepare("SELECT edu_id, level, school_name, school_address, year_completed FROM educational_history WHERE student_id = ? ORDER BY CASE level WHEN 'Elementary' THEN 1 WHEN 'JHS' THEN 2 ELSE 3 END");
+$s->bind_param("i", $student_id);
+$s->execute();
+$education = $s->get_result()->fetch_all(MYSQLI_ASSOC);
+$s->close();
 
 // Documents
-$s=$conn->prepare("
+$s = $conn->prepare("
     SELECT d.entrance_id, d.document_name, d.submitted, d.file_path,
            d.uploaded_at, d.file_name, d.file_mime,
            CASE WHEN d.file_data IS NOT NULL THEN 1 ELSE 0 END AS has_blob,
@@ -412,9 +715,9 @@ $s=$conn->prepare("
         d.submitted DESC,
         d.uploaded_at DESC
 ");
-$s->bind_param("i",$student_id);
+$s->bind_param("i", $student_id);
 $s->execute();
-$raw_docs=$s->get_result()->fetch_all(MYSQLI_ASSOC);
+$raw_docs = $s->get_result()->fetch_all(MYSQLI_ASSOC);
 $s->close();
 
 $best_by_norm = [];
@@ -447,7 +750,7 @@ $docs_ok = 0;
 foreach ($documents as $d) {
     if (empty($d['submitted'])) continue;
     $hasBlob = !empty($d['has_blob']);
-    $hasPath = !empty($d['file_path']) && file_exists(document_abs_path($d['file_path']));
+    $hasPath = !empty($d['file_path']) && is_file(document_abs_path($d['file_path']));
     if ($hasBlob || $hasPath) $docs_ok++;
 }
 
@@ -475,13 +778,27 @@ while ($row = $grades_result->fetch_assoc()) {
 $grades_stmt->close();
 
 $total_grade_points = 0; $grade_count = 0;
-foreach ($all_grades_flat as $g) { if ($g['grade'] !== null && is_numeric($g['grade'])) { $total_grade_points += (float)$g['grade']; $grade_count++; } }
+foreach ($all_grades_flat as $g) {
+    if ($g['grade'] !== null && is_numeric($g['grade'])) {
+        $total_grade_points += (float)$g['grade'];
+        $grade_count++;
+    }
+}
 $overall_gwa = $grade_count > 0 ? round($total_grade_points / $grade_count, 2) : null;
 
 $gwa_per_year = [];
 foreach ($academic_record as $sy => $levels) {
     $yt = 0; $yc = 0;
-    foreach ($levels as $gl => $terms) { foreach ($terms as $tm => $subjects) { foreach ($subjects as $subj) { if ($subj['grade'] !== null && is_numeric($subj['grade'])) { $yt += (float)$subj['grade']; $yc++; } } } }
+    foreach ($levels as $gl => $terms) {
+        foreach ($terms as $tm => $subjects) {
+            foreach ($subjects as $subj) {
+                if ($subj['grade'] !== null && is_numeric($subj['grade'])) {
+                    $yt += (float)$subj['grade'];
+                    $yc++;
+                }
+            }
+        }
+    }
     $gwa_per_year[$sy] = $yc > 0 ? round($yt / $yc, 2) : null;
 }
 
@@ -491,7 +808,10 @@ foreach ($academic_record as $sy => $levels) {
         foreach ($terms as $tm => $subjects) {
             $tt = 0; $tc = 0;
             foreach ($subjects as $subj) {
-                if ($subj['grade'] !== null && is_numeric($subj['grade'])) { $tt += (float)$subj['grade']; $tc++; }
+                if ($subj['grade'] !== null && is_numeric($subj['grade'])) {
+                    $tt += (float)$subj['grade'];
+                    $tc++;
+                }
             }
             $term_gwa[$sy][$gl][$tm] = $tc > 0 ? round($tt / $tc, 2) : null;
         }
@@ -508,16 +828,17 @@ if ($stat_strand !== '' && $stat_section === $stat_strand && $stat_program !== '
     $strand_fallback = true;
 }
 
-$theme=isset($_COOKIE['admin_theme'])&&$_COOKIE['admin_theme']==='dark'?'dark':'light';
-$initials=strtoupper(substr($student['first_name']??'',0,1).substr($student['last_name']??'',0,1));
+$theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 'dark' : 'light';
+$initials = strtoupper(substr($student['first_name'] ?? '', 0, 1) . substr($student['last_name'] ?? '', 0, 1));
 
 $photo_abs = !empty($student['photo']) ? student_photo_abs_path($student['photo']) : '';
-$photo = ($photo_abs && file_exists($photo_abs)) ? 'photo.php?id=' . (int)$student_id : '';
+$photo = ($photo_abs && is_file($photo_abs)) ? 'photo.php?id=' . (int)$student_id : '';
 
 $fullName = htmlspecialchars(formatStudentName($student));
 
 $currentTerm = getCurrentTerm();
 $terms       = getTerms();
+$csrf_token  = csrf_token();
 ?>
 
 <!DOCTYPE html>
@@ -530,283 +851,1474 @@ $terms       = getTerms();
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
     <style>
+        /* ============================================================
+           Design tokens (matches dashboard.php / student_profile.php)
+           ============================================================ */
         :root {
-            --bg: #f0f2f5; --surface: #ffffff; --text: #1a1f36; --text2: #6b7280;
-            --border: #e5e7eb; --accent: #4f46e5; --accent2: #6366f1;
-            --green: #059669; --red: #dc2626; --amber: #d97706;
-            --shadow: 0 1px 3px rgba(0,0,0,0.1); --shadow-lg: 0 10px 25px rgba(0,0,0,0.08);
-            --radius: 12px; --radius-lg: 16px;
+            --bg: #f4f6fb;
+            --surface: #ffffff;
+            --surface-2: #f8fafc;
+            --text: #0f172a;
+            --text-2: #64748b;
+            --text-3: #94a3b8;
+            --border: #e5e7eb;
+            --border-strong: #d1d5db;
+            --accent: #4f46e5;
+            --accent-2: #6366f1;
+            --accent-soft: #eef2ff;
+            --green: #059669;
+            --green-soft: #d1fae5;
+            --red: #dc2626;
+            --red-soft: #fee2e2;
+            --amber: #d97706;
+            --amber-soft: #fef3c7;
+            --purple: #7c3aed;
+            --purple-soft: #ede9fe;
+            --blue: #2563eb;
+            --pink: #ec4899;
+
+            --shadow-xs: 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-sm: 0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-md: 0 4px 12px rgba(15,23,42,0.06);
+            --shadow-lg: 0 12px 32px rgba(15,23,42,0.10);
+
+            --radius-sm: 8px;
+            --radius: 12px;
+            --radius-lg: 16px;
+            --radius-xl: 20px;
+
+            --sidebar-w: 264px;
         }
+
         [data-bs-theme="dark"] {
-            --bg: #0f172a; --surface: #1e293b; --text: #f1f5f9; --text2: #94a3b8;
-            --border: #334155; --accent: #818cf8; --accent2: #6366f1;
+            --bg: #0b1220;
+            --surface: #131c2e;
+            --surface-2: #1a2439;
+            --text: #f1f5f9;
+            --text-2: #94a3b8;
+            --text-3: #64748b;
+            --border: #1f2a44;
+            --border-strong: #2d3b57;
+            --accent: #818cf8;
+            --accent-2: #6366f1;
+            --accent-soft: #1e2140;
+            --green-soft: #052e24;
+            --red-soft: #3f1517;
+            --amber-soft: #3d2a08;
+            --purple-soft: #2e1a54;
+
+            --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.35);
+            --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+            --shadow-lg: 0 12px 32px rgba(0,0,0,0.55);
         }
-        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
-        body{background:var(--bg);color:var(--text);min-height:100vh}
-        .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
-        .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
-        .sidebar-brand img{width:40px;height:40px;border-radius:10px}.sidebar-brand span{font-weight:700;font-size:1.1rem}
-        .sidebar-nav{flex:1;padding:1rem 0.75rem;overflow-y:auto}
-        .sidebar-nav a{display:flex;align-items:center;gap:0.75rem;padding:0.7rem 1rem;border-radius:10px;color:var(--text2);text-decoration:none;font-weight:500;font-size:0.9rem;transition:all 0.2s;margin-bottom:0.25rem}
-        .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
-        .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
-        .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
-        .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
-        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
-        .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
-        .card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);margin-bottom:1.25rem;overflow:hidden}
-        .card-header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
-        .card-header h3{margin:0;font-size:0.95rem;font-weight:600;display:flex;align-items:center;gap:0.5rem}.card-header h3 i{color:var(--accent)}
-        .card-body{padding:1.5rem}.card-body.no-padding{padding:0}
-        .hero{display:flex;gap:2rem;align-items:center;flex-wrap:wrap;padding:2rem}
-        .hero-avatar img,.hero-avatar .avatar-fallback{width:110px;height:110px;border-radius:50%;object-fit:cover;border:4px solid var(--accent);box-shadow:0 0 0 4px rgba(79,70,229,0.2)}
-        .hero-avatar .avatar-fallback{background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;color:white;font-size:2.5rem;font-weight:800}
-        .hero-avatar .camera-btn{position:absolute;bottom:0;right:0;width:34px;height:34px;border-radius:50%;background:var(--surface);border:2px solid var(--border);cursor:pointer;display:flex;align-items:center;justify-content:center;color:var(--accent)}
-        .hero-info h1{font-size:1.6rem;font-weight:700;margin-bottom:0.5rem}
-        .hero-badges{display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:1rem}
-        .badge-pill{display:inline-flex;align-items:center;gap:0.35rem;padding:0.3rem 0.75rem;border-radius:50px;font-size:0.75rem;font-weight:600}
-        .badge-pill.primary{background:#eef2ff;color:#4338ca}.badge-pill.success{background:#d1fae5;color:#065f46}.badge-pill.info{background:#dbeafe;color:#1e40af}
-        [data-bs-theme="dark"] .badge-pill.primary{background:#312e81;color:#a5b4fc}[data-bs-theme="dark"] .badge-pill.success{background:#064e3b;color:#6ee7b7}[data-bs-theme="dark"] .badge-pill.info{background:#1e3a5f;color:#93c5fd}
-        .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem}
-        .stat-card{background:var(--bg);border-radius:var(--radius);padding:1rem;text-align:center;display:flex;flex-direction:column;justify-content:center;min-height:96px}
-        .stat-value{font-size:1.5rem;font-weight:700;color:var(--accent);line-height:1.15;word-break:break-word}
-        .stat-value.sm{font-size:1.05rem}
-        .stat-value.xs{font-size:0.82rem;font-weight:600;line-height:1.25}
-        .stat-label{font-size:0.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-top:0.35rem}
-        .info-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:0;border-top:1px solid var(--border);border-left:1px solid var(--border)}
-        .info-cell{padding:0.75rem 1rem;border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
-        .info-cell .label{font-size:0.68rem;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:0.2rem}
-        .info-cell .value{font-weight:500;font-size:0.88rem}.info-cell.span-2{grid-column:span 2}
-        .table-admin{width:100%;border-collapse:collapse}
-        .table-admin th{background:var(--bg);font-size:0.7rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;padding:0.7rem 0.8rem;text-align:left;border-bottom:2px solid var(--border)}
-        .table-admin td{padding:0.6rem 0.8rem;border-bottom:1px solid var(--border);font-size:0.82rem;vertical-align:middle}
-        .table-admin tr:hover td{background:rgba(79,70,229,0.03)}
-        .academic-sy-header{background:var(--bg);padding:0.75rem 1.5rem;border-bottom:1px solid var(--border)}
-        .term-group{margin:0.5rem 1.5rem;padding:0.75rem 1rem;border-radius:var(--radius);border-left:4px solid}
-        .status-dot{display:inline-flex;align-items:center;gap:0.35rem;font-size:0.78rem;font-weight:600}
-        .status-dot::before{content:'';width:8px;height:8px;border-radius:50%}
-        .status-dot.success::before{background:var(--green)}.status-dot.danger::before{background:var(--red)}
-        .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center}
-        .theme-btn:hover{background:var(--accent);color:white}
-        .btn{font-weight:500;border-radius:8px}.btn-xs{padding:0.2rem 0.5rem;font-size:0.7rem;border-radius:6px}
-        .btn-icon{width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:8px}
-        .btn-group-actions{display:flex;gap:0.35rem}
-        .breadcrumb-nav{display:flex;align-items:center;gap:0.5rem;font-size:0.82rem;color:var(--text2);margin-bottom:0.25rem}
+
+        *{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;padding:0;box-sizing:border-box}
+        html,body{height:100%}
+        body{background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
+
+        /* ============================================================
+           Sidebar
+           ============================================================ */
+        .sidebar{
+            position:fixed;left:0;top:0;bottom:0;width:var(--sidebar-w);
+            background:var(--surface);border-right:1px solid var(--border);
+            z-index:200;display:flex;flex-direction:column;
+            transition:transform .28s cubic-bezier(.4,0,.2,1);
+        }
+        .sidebar-brand{
+            padding:1.25rem 1.5rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;gap:.75rem;
+        }
+        .sidebar-brand img{
+            width:38px;height:38px;border-radius:10px;object-fit:cover;
+            box-shadow:0 0 0 3px var(--accent-soft);
+        }
+        .sidebar-brand .brand-text{display:flex;flex-direction:column;line-height:1.15}
+        .sidebar-brand .brand-name{font-weight:700;font-size:.95rem;color:var(--text)}
+        .sidebar-brand .brand-sub{font-size:.68rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+
+        .sidebar-nav{flex:1;padding:.75rem .75rem 1rem;overflow-y:auto}
+        .sidebar-nav .nav-label{
+            font-size:.65rem;font-weight:700;color:var(--text-3);
+            text-transform:uppercase;letter-spacing:.8px;
+            padding:.75rem .75rem .35rem;
+        }
+        .sidebar-nav a{
+            display:flex;align-items:center;gap:.75rem;
+            padding:.6rem .75rem;border-radius:10px;
+            color:var(--text-2);text-decoration:none;
+            font-weight:500;font-size:.875rem;
+            transition:background .15s, color .15s;
+            margin-bottom:.1rem;
+        }
+        .sidebar-nav a:hover{background:var(--surface-2);color:var(--text)}
+        .sidebar-nav a.active{background:var(--accent);color:#fff;box-shadow:0 4px 12px -4px rgba(79,70,229,.5)}
+        .sidebar-nav a.active:hover{background:var(--accent)}
+        .sidebar-nav a i{font-size:1.05rem;width:20px;text-align:center;flex-shrink:0}
+        .sidebar-footer{padding:.75rem;border-top:1px solid var(--border)}
+
+        /* ============================================================
+           Main content
+           ============================================================ */
+        .main-content{
+            margin-left:var(--sidebar-w);
+            padding:1.5rem clamp(1rem,2.5vw,2rem) 2rem;
+            min-height:100vh;
+            max-width:1600px;
+        }
+        .topbar{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:1.5rem;gap:1rem;flex-wrap:wrap;
+        }
+        .topbar h2{font-size:1.35rem;font-weight:700;letter-spacing:-.02em;margin:0}
+        .topbar .sub{font-size:.85rem;color:var(--text-2);margin:0}
+        .menu-toggle{
+            display:none;width:40px;height:40px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text);cursor:pointer;
+            align-items:center;justify-content:center;
+            transition:background .15s;
+        }
+        .menu-toggle:hover{background:var(--surface-2)}
+        .breadcrumb-nav{
+            display:flex;align-items:center;gap:.4rem;
+            font-size:.78rem;color:var(--text-2);
+            margin-bottom:.25rem;
+        }
         .breadcrumb-nav a{color:var(--accent);text-decoration:none;font-weight:500}
-        @media(max-width:1024px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main-content{margin-left:0}.menu-toggle{display:flex}.hero{flex-direction:column;text-align:center}.hero-badges{justify-content:center}}
-        @media(max-width:640px){.main-content{padding:1rem}.info-grid{grid-template-columns:1fr}.info-cell.span-2{grid-column:span 1}.stat-grid{grid-template-columns:repeat(2,1fr)}}
+        .breadcrumb-nav a:hover{text-decoration:underline}
+
+        /* ============================================================
+           Cards
+           ============================================================ */
+        .card{
+            background:var(--surface);border-radius:var(--radius-lg);
+            border:1px solid var(--border);box-shadow:var(--shadow-sm);
+            margin-bottom:1.25rem;overflow:hidden;
+        }
+        .card-header{
+            padding:.9rem 1.25rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;justify-content:space-between;
+            gap:1rem;flex-wrap:wrap;background:var(--surface);
+        }
+        .card-header h3{
+            margin:0;font-size:.9rem;font-weight:600;
+            display:flex;align-items:center;gap:.5rem;color:var(--text);
+        }
+        .card-header h3 i{color:var(--accent);font-size:1rem}
+        .card-header .hint{font-size:.75rem;color:var(--text-2);font-weight:500}
+        .card-body{padding:1.25rem}
+        .card-body.no-padding{padding:0}
+
+        /* ============================================================
+           Hero (student header)
+           ============================================================ */
+        .hero{
+            display:flex;gap:1.75rem;align-items:center;flex-wrap:wrap;
+            padding:1.5rem 1.75rem;
+        }
+        .hero-avatar{position:relative;flex-shrink:0}
+        .hero-avatar img,
+        .hero-avatar .avatar-fallback{
+            width:104px;height:104px;border-radius:50%;object-fit:cover;
+            box-shadow:0 0 0 4px var(--surface), 0 0 0 6px var(--accent-soft);
+        }
+        .hero-avatar .avatar-fallback{
+            background:linear-gradient(135deg,var(--accent),var(--accent-2));
+            display:flex;align-items:center;justify-content:center;
+            color:#fff;font-size:2.3rem;font-weight:800;letter-spacing:-.03em;
+        }
+        .hero-avatar .camera-btn{
+            position:absolute;bottom:2px;right:2px;
+            width:32px;height:32px;border-radius:50%;
+            background:var(--surface);border:2px solid var(--border);
+            cursor:pointer;display:flex;align-items:center;justify-content:center;
+            color:var(--accent);transition:all .15s;
+        }
+        .hero-avatar .camera-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+        .hero-info{flex:1;min-width:0}
+        .hero-info h1{
+            font-size:1.5rem;font-weight:700;letter-spacing:-.02em;
+            margin:0 0 .6rem;word-break:break-word;
+        }
+        .hero-badges{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.75rem}
+
+        /* ============================================================
+           Pills / Badges
+           ============================================================ */
+        .pill{
+            display:inline-flex;align-items:center;gap:.35rem;
+            padding:.25rem .65rem;border-radius:999px;
+            font-size:.72rem;font-weight:600;
+            border:1px solid transparent;
+            white-space:nowrap;
+        }
+        .pill i{font-size:.75rem}
+        .pill.primary{background:var(--accent-soft);color:var(--accent);border-color:color-mix(in srgb, var(--accent) 22%, transparent)}
+        .pill.success{background:var(--green-soft);color:var(--green);border-color:color-mix(in srgb, var(--green) 22%, transparent)}
+        .pill.info   {background:#dbeafe;color:#1e40af;border-color:rgba(30,64,175,.15)}
+        .pill.warning{background:var(--amber-soft);color:var(--amber);border-color:color-mix(in srgb, var(--amber) 22%, transparent)}
+        .pill.danger {background:var(--red-soft);color:var(--red);border-color:color-mix(in srgb, var(--red) 22%, transparent)}
+        .pill.muted  {background:var(--surface-2);color:var(--text-2);border-color:var(--border)}
+        [data-bs-theme="dark"] .pill.info{background:#1e3a5f;color:#93c5fd;border-color:rgba(147,197,253,.15)}
+
+        .status-dot{
+            display:inline-flex;align-items:center;gap:.4rem;
+            font-size:.75rem;font-weight:600;
+        }
+        .status-dot::before{
+            content:'';width:7px;height:7px;border-radius:50%;
+            flex-shrink:0;background:currentColor;opacity:.9;
+        }
+        .status-dot.success{color:var(--green)}
+        .status-dot.danger {color:var(--red)}
+        .status-dot.warning{color:var(--amber)}
+
+        /* ============================================================
+           Stat grid
+           ============================================================ */
+        .stat-grid{
+            display:grid;
+            grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+            gap:.85rem;
+        }
+        .stat-card{
+            position:relative;
+            background:var(--surface);border-radius:var(--radius);
+            border:1px solid var(--border);box-shadow:var(--shadow-xs);
+            padding:.95rem 1rem .95rem 1.15rem;
+            overflow:hidden;
+            transition:transform .15s, box-shadow .15s;
+        }
+        .stat-card::before{
+            content:'';position:absolute;left:0;top:0;bottom:0;width:3px;
+            background:var(--accent);
+        }
+        .stat-card.tone-green::before {background:var(--green)}
+        .stat-card.tone-purple::before{background:var(--purple)}
+        .stat-card.tone-amber::before {background:var(--amber)}
+        .stat-card.tone-red::before   {background:var(--red)}
+        .stat-card.tone-blue::before  {background:var(--accent)}
+        .stat-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
+
+        .stat-value{
+            font-size:1.25rem;font-weight:700;line-height:1.15;
+            color:var(--text);letter-spacing:-.015em;
+            word-break:break-word;font-variant-numeric:tabular-nums;
+        }
+        .stat-value.sm{font-size:1rem}
+        .stat-value.xs{font-size:.82rem;font-weight:600}
+        .stat-label{
+            font-size:.68rem;color:var(--text-2);text-transform:uppercase;
+            letter-spacing:.6px;margin-top:.25rem;font-weight:600;
+        }
+
+        /* ============================================================
+           Info grid (key/value cells)
+           ============================================================ */
+        .info-grid{
+            display:grid;
+            grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
+            gap:0;
+            border-top:1px solid var(--border);
+            border-left:1px solid var(--border);
+        }
+        .info-cell{
+            padding:.7rem 1rem;
+            border-right:1px solid var(--border);
+            border-bottom:1px solid var(--border);
+            background:var(--surface);
+        }
+        .info-cell .label{
+            font-size:.66rem;font-weight:700;color:var(--text-2);
+            text-transform:uppercase;letter-spacing:.6px;
+            margin-bottom:.2rem;
+        }
+        .info-cell .value{
+            font-weight:500;font-size:.85rem;color:var(--text);
+            word-break:break-word;
+        }
+        .info-cell .value.accent{color:var(--accent);font-weight:700}
+        .info-cell.span-2{grid-column:span 2;background:var(--surface-2)}
+        .info-cell.span-full{grid-column:1 / -1;background:var(--surface-2)}
+
+        /* ============================================================
+           Table
+           ============================================================ */
+        .table-scroll{overflow-x:auto}
+        .table-admin{width:100%;border-collapse:separate;border-spacing:0}
+        .table-admin thead th{
+            background:var(--surface-2);
+            font-size:.66rem;font-weight:700;color:var(--text-2);
+            text-transform:uppercase;letter-spacing:.6px;
+            padding:.65rem .9rem;text-align:left;
+            border-bottom:1px solid var(--border);
+            white-space:nowrap;
+        }
+        .table-admin tbody td{
+            padding:.65rem .9rem;border-bottom:1px solid var(--border);
+            font-size:.83rem;vertical-align:middle;
+            transition:background .12s;
+        }
+        .table-admin tbody tr:hover td{background:color-mix(in srgb, var(--accent) 4%, transparent)}
+        .table-admin tbody tr:last-child td{border-bottom:none}
+        .cell-strong{font-weight:600;color:var(--text)}
+        .cell-muted{color:var(--text-2);font-size:.82rem}
+        .cell-accent{color:var(--accent);font-weight:600}
+        .cell-num{
+            font-variant-numeric:tabular-nums;font-weight:600;
+            color:var(--text);font-size:.85rem;
+        }
+        .cell-right{text-align:right}
+
+        /* ============================================================
+           Document row — file metadata
+           ============================================================ */
+        .file-meta{
+            font-size:.72rem;color:var(--text-2);
+            display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;
+            margin-top:.2rem;
+        }
+        .file-meta .dot{opacity:.5}
+        .file-name{
+            font-weight:600;font-size:.82rem;color:var(--text);
+            display:flex;align-items:center;gap:.35rem;
+            max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+        }
+        .file-name i{color:var(--accent);flex-shrink:0}
+
+        /* ============================================================
+           Academic record
+           ============================================================ */
+        .sy-header{
+            background:var(--surface-2);
+            padding:.75rem 1.25rem;
+            border-bottom:1px solid var(--border);
+            display:flex;align-items:center;justify-content:space-between;
+            flex-wrap:wrap;gap:.5rem;
+        }
+        .sy-header h6{
+            margin:0;font-size:.85rem;font-weight:700;
+            color:var(--accent);
+            display:flex;align-items:center;gap:.5rem;
+        }
+        .grade-level-band{
+            padding:.55rem 1.25rem;
+            background:color-mix(in srgb, var(--accent) 5%, transparent);
+            border-bottom:1px solid var(--border);
+        }
+        .grade-level-band h6{
+            margin:0;font-size:.78rem;font-weight:700;
+            color:var(--text);
+            display:flex;align-items:center;gap:.5rem;
+        }
+        .grade-level-band i{color:var(--accent)}
+
+        .term-block{
+            margin:.75rem 1rem;
+            padding:.75rem .85rem;
+            border-radius:var(--radius);
+            border-left:4px solid var(--accent);
+            background:var(--accent-soft);
+        }
+        .term-block.term-1{background:var(--accent-soft);border-left-color:var(--accent)}
+        .term-block.term-2{background:#dbeafe;border-left-color:#2563eb}
+        .term-block.term-3{background:var(--purple-soft);border-left-color:var(--purple)}
+        [data-bs-theme="dark"] .term-block.term-2{background:#1e3a5f}
+        [data-bs-theme="dark"] .term-block.term-3{background:var(--purple-soft)}
+
+        .term-head{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:.6rem;flex-wrap:wrap;gap:.5rem;
+        }
+        .term-title{
+            font-size:.78rem;font-weight:700;
+            display:flex;align-items:center;gap:.4rem;
+        }
+        .term-block.term-1 .term-title{color:var(--accent)}
+        .term-block.term-2 .term-title{color:#1e40af}
+        .term-block.term-3 .term-title{color:var(--purple)}
+
+        .term-gwa{
+            font-size:.68rem;font-weight:600;
+            background:var(--surface);
+            padding:.2rem .55rem;border-radius:999px;
+            border:1px solid var(--border);
+        }
+        .term-block.term-1 .term-gwa{color:var(--accent)}
+        .term-block.term-2 .term-gwa{color:#1e40af}
+        .term-block.term-3 .term-gwa{color:var(--purple)}
+
+        .term-block .table-admin{
+            background:var(--surface);
+            border-radius:8px;overflow:hidden;
+        }
+        .term-block .table-admin th{
+            font-size:.62rem;padding:.5rem .7rem;
+        }
+        .term-block .table-admin td{
+            font-size:.78rem;padding:.5rem .7rem;
+        }
+        .grade-pass{color:var(--green);font-weight:700;font-variant-numeric:tabular-nums}
+        .grade-fail{color:var(--red);font-weight:700;font-variant-numeric:tabular-nums}
+
+        /* ============================================================
+           Buttons
+           ============================================================ */
+        .btn{font-weight:500;border-radius:9px;font-size:.82rem;transition:all .15s}
+        .btn-primary{background:var(--accent);border-color:var(--accent)}
+        .btn-primary:hover{background:var(--accent-2);border-color:var(--accent-2)}
+        .btn-outline-primary{color:var(--accent);border-color:var(--border-strong)}
+        .btn-outline-primary:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+        .btn-outline-secondary{color:var(--text-2);border-color:var(--border)}
+        .btn-outline-secondary:hover{background:var(--surface-2);color:var(--text);border-color:var(--border-strong)}
+        .btn-outline-success{color:var(--green);border-color:color-mix(in srgb, var(--green) 35%, transparent)}
+        .btn-outline-success:hover{background:var(--green);color:#fff;border-color:var(--green)}
+        .btn-outline-warning{color:var(--amber);border-color:color-mix(in srgb, var(--amber) 40%, transparent)}
+        .btn-outline-warning:hover{background:var(--amber);color:#fff;border-color:var(--amber)}
+        .btn-outline-danger{color:var(--red);border-color:color-mix(in srgb, var(--red) 35%, transparent)}
+        .btn-outline-danger:hover{background:var(--red);color:#fff;border-color:var(--red)}
+        .btn-icon{
+            width:32px;height:32px;padding:0;
+            display:inline-flex;align-items:center;justify-content:center;
+            border-radius:9px;
+        }
+        .btn-xs{padding:.25rem .6rem;font-size:.72rem;border-radius:8px}
+        .theme-btn{
+            width:38px;height:38px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text-2);cursor:pointer;
+            display:flex;align-items:center;justify-content:center;
+            transition:all .15s;
+        }
+        .theme-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+        .btn-group-actions{display:flex;gap:.35rem;flex-wrap:wrap}
+
+        /* ============================================================
+           Modals
+           ============================================================ */
+        .modal-content{border-radius:var(--radius-lg);border:none;box-shadow:var(--shadow-lg)}
+        .modal-header{
+            padding:1rem 1.25rem;border-bottom:1px solid var(--border);
+            border-top-left-radius:var(--radius-lg);border-top-right-radius:var(--radius-lg);
+        }
+        .modal-header.bg-danger{background:var(--red) !important}
+        .modal-header .modal-title{font-size:.92rem}
+        .modal-body{padding:1.25rem}
+        .modal-footer{padding:.85rem 1.25rem;border-top:1px solid var(--border)}
+        .form-label{font-size:.78rem;font-weight:600;color:var(--text-2);margin-bottom:.35rem}
+        .form-control,.form-select{
+            background:var(--surface-2);border:1px solid var(--border);
+            border-radius:10px;padding:.5rem .8rem;font-size:.85rem;
+            color:var(--text);transition:border-color .15s, box-shadow .15s;
+        }
+        .form-control:focus,.form-select:focus{
+            border-color:var(--accent);background:var(--surface);
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+        }
+        .form-text{font-size:.72rem;color:var(--text-3)}
+
+        /* ============================================================
+           Empty state
+           ============================================================ */
+        .empty{
+            padding:2.5rem 1.5rem;text-align:center;color:var(--text-2);
+        }
+        .empty .empty-icon{
+            width:56px;height:56px;border-radius:50%;
+            background:var(--surface-2);color:var(--text-3);
+            display:inline-flex;align-items:center;justify-content:center;
+            font-size:1.4rem;margin-bottom:.85rem;
+        }
+        .empty .empty-title{font-weight:600;color:var(--text);margin-bottom:.2rem}
+        .empty .empty-sub{font-size:.82rem;color:var(--text-2)}
+
+        /* ============================================================
+           Flash alerts
+           ============================================================ */
+        .flash{
+            display:flex;align-items:center;gap:.65rem;
+            padding:.75rem 1rem;border-radius:var(--radius);
+            margin-bottom:1rem;font-size:.88rem;font-weight:500;
+            border:1px solid transparent;
+        }
+        .flash.success{background:var(--green-soft);color:var(--green);border-color:color-mix(in srgb, var(--green) 25%, transparent)}
+        .flash.error  {background:var(--red-soft);  color:var(--red);  border-color:color-mix(in srgb, var(--red) 25%, transparent)}
+        .flash .btn-close{margin-left:auto;opacity:.6}
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width:1024px){
+            .sidebar{transform:translateX(-100%)}
+            .sidebar.open{transform:translateX(0)}
+            .main-content{margin-left:0}
+            .menu-toggle{display:flex}
+            .hero{flex-direction:column;text-align:center;padding:1.5rem 1rem}
+            .hero-badges{justify-content:center}
+            .hero-info h1{font-size:1.3rem}
+        }
+        @media (max-width:640px){
+            .main-content{padding:1rem}
+            .stat-grid{grid-template-columns:repeat(2,1fr)}
+            .info-grid{grid-template-columns:1fr}
+            .info-cell.span-2{grid-column:span 1}
+            .term-block{margin:.5rem .5rem}
+            .grade-level-band{padding:.55rem .75rem}
+            .sy-header{padding:.65rem .75rem}
+        }
     </style>
 </head>
 <body>
 
+<!-- ================= Sidebar ================= -->
 <aside class="sidebar" id="sidebar">
-    <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
+    <div class="sidebar-brand">
+        <img src="../assets/img/usat.jpg" alt="USAT" onerror="this.style.background='var(--accent)'">
+        <div class="brand-text">
+            <span class="brand-name">USAT Admin</span>
+            <span class="brand-sub">Enrollment System</span>
+        </div>
+    </div>
     <nav class="sidebar-nav">
+        <div class="nav-label">Overview</div>
         <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
         <a href="student_profile.php" class="active"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
+        <div class="nav-label" style="margin-top:.5rem">Administration</div>
         <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
+        <?php if (($_SESSION['admin_role'] ?? '') === 'superadmin'): ?>
+            <a href="audit_log.php"><i class="bi bi-shield-check"></i> Audit Log</a>
+        <?php endif; ?>
     </nav>
-    <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
+    <div class="sidebar-footer">
+        <a href="logout.php" class="btn btn-outline-danger btn-sm w-100">
+            <i class="bi bi-box-arrow-right me-1"></i> Logout
+        </a>
+    </div>
 </aside>
 
 <div class="main-content" id="mainContent">
-    <?php if(isset($_SESSION['success'])): ?><div class="alert alert-success alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-check-circle-fill fs-5"></i> <?= $_SESSION['success'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['success']); endif; ?>
-    <?php if(isset($_SESSION['error'])): ?><div class="alert alert-danger alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-exclamation-triangle-fill fs-5"></i> <?= $_SESSION['error'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['error']); endif; ?>
 
+    <!-- ================= Flash alerts ================= -->
+    <?php if(isset($_SESSION['success'])): ?>
+        <div class="flash success">
+            <i class="bi bi-check-circle-fill"></i>
+            <span><?= htmlspecialchars($_SESSION['success']) ?></span>
+            <button class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        <?php unset($_SESSION['success']); endif; ?>
+    <?php if(isset($_SESSION['error'])): ?>
+        <div class="flash error">
+            <i class="bi bi-exclamation-triangle-fill"></i>
+            <span><?= htmlspecialchars($_SESSION['error']) ?></span>
+            <button class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        <?php unset($_SESSION['error']); endif; ?>
+
+    <!-- ================= Topbar ================= -->
     <div class="topbar">
-        <div class="d-flex align-items-center gap-3"><button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button><div><div class="breadcrumb-nav"><a href="student_profile.php">Students</a> <i class="bi bi-chevron-right small"></i> Profile</div><h2 style="font-size:1.3rem;font-weight:700;margin:0">Student Profile</h2></div></div>
+        <div class="d-flex align-items-center gap-3">
+            <button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button>
+            <div>
+                <div class="breadcrumb-nav">
+                    <a href="student_profile.php">Students</a>
+                    <i class="bi bi-chevron-right" style="font-size:.7rem;opacity:.6"></i>
+                    <span>Profile</span>
+                </div>
+                <h2>Student Profile</h2>
+            </div>
+        </div>
         <div class="d-flex gap-2 flex-wrap">
-            <a href="sf10.php?id=<?= $student_id ?>" class="btn btn-outline-primary btn-sm" target="_blank"><i class="bi bi-file-earmark-text me-1"></i> SF10</a>
-            <a href="export_students.php?student_id=<?= $student_id ?>" class="btn btn-outline-success btn-sm"><i class="bi bi-download me-1"></i> Export</a>
-            <button class="btn btn-outline-secondary btn-sm" onclick="window.print()"><i class="bi bi-printer me-1"></i> Print</button>
-            <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+            <a href="sf10.php?id=<?= (int)$student_id ?>" class="btn btn-outline-primary btn-sm" target="_blank">
+                <i class="bi bi-file-earmark-text me-1"></i> SF10
+            </a>
+            <a href="export_students.php?student_id=<?= (int)$student_id ?>" class="btn btn-outline-success btn-sm">
+                <i class="bi bi-download me-1"></i> Export
+            </a>
+            <button class="btn btn-outline-secondary btn-sm" onclick="window.print()">
+                <i class="bi bi-printer me-1"></i> Print
+            </button>
+            <button class="theme-btn" id="themeToggle" title="Toggle theme">
+                <i class="bi bi-moon-stars-fill" id="themeIcon"></i>
+            </button>
         </div>
     </div>
 
-    <div class="card"><div class="hero">
-        <div class="hero-avatar position-relative"><?php if($photo): ?><img src="<?= $photo ?>" alt="Photo"><?php else: ?><div class="avatar-fallback"><?= $initials ?></div><?php endif; ?><button class="camera-btn" data-bs-toggle="modal" data-bs-target="#uploadPhotoModal"><i class="bi bi-camera-fill small"></i></button></div>
-        <div class="hero-info flex-grow-1"><h1><?= $fullName ?></h1><div class="hero-badges"><span class="badge-pill primary"><i class="bi bi-upc-scan"></i> LRN: <?= htmlspecialchars($student['lrn']??'N/A') ?></span><span class="badge-pill info"><i class="bi bi-person-badge"></i> <?= htmlspecialchars($student['student_id_number']??'No ID') ?></span><?php if($overall_gwa!==null): ?><span class="badge-pill success"><i class="bi bi-star-fill"></i> GWA: <?= number_format($overall_gwa,2) ?></span><?php endif; ?><span class="badge-pill <?= ($enrollment['status']??'Active')=='Active'?'success':'warning' ?>"><?= $enrollment['status']??'Active' ?></span></div><div class="btn-group-actions mt-2"><a href="edit_student.php?id=<?= $student_id ?>" class="btn btn-outline-primary btn-sm"><i class="bi bi-pencil-square me-1"></i> Edit</a><button class="btn btn-outline-danger btn-sm" data-bs-toggle="modal" data-bs-target="#deleteStudentModal"><i class="bi bi-trash3 me-1"></i> Delete</button></div></div>
-    </div></div>
+    <!-- ================= Hero ================= -->
+    <div class="card">
+        <div class="hero">
+            <div class="hero-avatar">
+                <?php if($photo): ?>
+                    <img src="<?= $photo ?>" alt="Photo">
+                <?php else: ?>
+                    <div class="avatar-fallback"><?= htmlspecialchars($initials) ?></div>
+                <?php endif; ?>
+                <button class="camera-btn" data-bs-toggle="modal" data-bs-target="#uploadPhotoModal" title="Change photo">
+                    <i class="bi bi-camera-fill" style="font-size:.75rem"></i>
+                </button>
+            </div>
+            <div class="hero-info">
+                <h1><?= $fullName ?></h1>
+                <div class="hero-badges">
+                    <span class="pill primary">
+                        <i class="bi bi-upc-scan"></i>
+                        LRN: <?= htmlspecialchars($student['lrn'] ?? 'N/A') ?>
+                    </span>
+                    <span class="pill info">
+                        <i class="bi bi-person-badge"></i>
+                        <?= htmlspecialchars($student['student_id_number'] ?? 'No ID') ?>
+                    </span>
+                    <?php if($overall_gwa !== null): ?>
+                        <span class="pill success">
+                            <i class="bi bi-star-fill"></i>
+                            GWA: <?= number_format($overall_gwa, 2) ?>
+                        </span>
+                    <?php endif; ?>
+                    <span class="pill <?= ($enrollment['status'] ?? 'Active') === 'Active' ? 'success' : 'warning' ?>">
+                        <?= htmlspecialchars($enrollment['status'] ?? 'Active') ?>
+                    </span>
+                </div>
+                <div class="btn-group-actions">
+                    <a href="edit_student.php?id=<?= (int)$student_id ?>" class="btn btn-outline-primary btn-sm">
+                        <i class="bi bi-pencil-square me-1"></i> Edit
+                    </a>
+                    <button class="btn btn-outline-danger btn-sm" data-bs-toggle="modal" data-bs-target="#deleteStudentModal">
+                        <i class="bi bi-trash3 me-1"></i> Delete
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 
+    <!-- ================= Stat grid ================= -->
     <div class="stat-grid">
-        <div class="stat-card"><div class="stat-value <?= statSizeClass($stat_grade) ?>"><?= htmlspecialchars($stat_grade) ?></div><div class="stat-label">Grade</div></div>
-        <div class="stat-card"><div class="stat-value <?= statSizeClass($stat_section) ?>" title="<?= htmlspecialchars($stat_section) ?>"><?= htmlspecialchars($stat_section) ?></div><div class="stat-label">Section</div></div>
-        <div class="stat-card"><div class="stat-value <?= statSizeClass($stat_strand) ?>" title="<?= htmlspecialchars($stat_strand) ?>"><?= htmlspecialchars($stat_strand) ?></div><div class="stat-label"><?= $strand_fallback ? 'Program' : 'Strand' ?></div></div>
-        <div class="stat-card"><div class="stat-value"><?= htmlspecialchars($student['age'] ?? '—') ?></div><div class="stat-label">Age</div></div>
-        <div class="stat-card"><div class="stat-value"><?= htmlspecialchars($student['sex'] ?? '—') ?></div><div class="stat-label">Sex</div></div>
-        <div class="stat-card"><div class="stat-value"><?= $overall_gwa !== null ? number_format($overall_gwa, 2) : '—' ?></div><div class="stat-label">GWA</div></div>
-    </div>
-
-    <div class="row g-3 mt-2">
-        <div class="col-lg-6"><div class="card h-100"><div class="card-header"><h3><i class="bi bi-person-vcard"></i> Personal Information</h3></div><div class="card-body no-padding"><div class="info-grid"><div class="info-cell"><div class="label">Birth Date</div><div class="value"><?= htmlspecialchars($student['birth_date']??'—') ?></div></div><div class="info-cell"><div class="label">Civil Status</div><div class="value"><?= htmlspecialchars($student['civil_status']??'—') ?></div></div><div class="info-cell"><div class="label">Nationality</div><div class="value"><?= htmlspecialchars($student['nationality']??'—') ?></div></div><div class="info-cell"><div class="label">Religion</div><div class="value"><?= htmlspecialchars($student['religion']??'—') ?></div></div><div class="info-cell"><div class="label">Height</div><div class="value"><?= htmlspecialchars($student['height']??'—') ?> cm</div></div><div class="info-cell"><div class="label">Weight</div><div class="value"><?= htmlspecialchars($student['weight']??'—') ?> kg</div></div><div class="info-cell"><div class="label">Email</div><div class="value"><?= htmlspecialchars($student['email']??'—') ?></div></div><div class="info-cell"><div class="label">Phone</div><div class="value"><?= htmlspecialchars($student['phone']??'—') ?></div></div><div class="info-cell"><div class="label">Nickname</div><div class="value"><?= htmlspecialchars($student['nick_name']??'—') ?></div></div><div class="info-cell"><div class="label">Extension</div><div class="value"><?= htmlspecialchars($student['ext_name']??'—') ?></div></div><div class="info-cell span-2"><div class="label">Special Skills</div><div class="value"><?= nl2br(htmlspecialchars($student['special_skills']??'None')) ?></div></div></div></div></div></div>
-        <div class="col-lg-6">
-            <div class="card"><div class="card-header"><h3><i class="bi bi-mortarboard"></i> Enrollment Details</h3></div><div class="card-body no-padding"><?php if(!empty($enrollment)): ?><div class="info-grid"><div class="info-cell"><div class="label">School Year</div><div class="value"><?= htmlspecialchars($enrollment['school_year']??'—') ?></div></div><div class="info-cell"><div class="label">Grade Level</div><div class="value"><?= htmlspecialchars($enrollment['grade_level']??'—') ?></div></div><div class="info-cell"><div class="label">Term</div><div class="value"><?= htmlspecialchars($enrollment['term']??'—') ?></div></div><div class="info-cell"><div class="label">Section</div><div class="value fw-bold" style="color:var(--accent)"><?= htmlspecialchars($enrollment['section']??'—') ?></div></div><div class="info-cell"><div class="label">Track</div><div class="value"><?= htmlspecialchars($enrollment['track']??'—') ?></div></div><div class="info-cell"><div class="label">Strand</div><div class="value"><?= htmlspecialchars($enrollment['strand']??'—') ?></div></div><div class="info-cell"><div class="label">Program</div><div class="value"><?= htmlspecialchars($enrollment['program']??'—') ?></div></div><div class="info-cell"><div class="label">Voucher Status</div><div class="value"><?= htmlspecialchars($enrollment['voucher_status']??'—') ?></div></div><div class="info-cell"><div class="label">4Ps ID</div><div class="value"><?= htmlspecialchars($enrollment['household_id']??'—') ?></div></div><div class="info-cell"><div class="label">Status</div><div class="value"><span class="status-dot <?= ($enrollment['status']??'Active')=='Active'?'success':'danger' ?>"><?= $enrollment['status']??'Active' ?></span></div></div></div><?php else: ?><div class="p-4 text-center text-muted">No enrollment record.</div><?php endif; ?></div></div>
-            <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-geo-alt"></i> Address</h3></div><div class="card-body no-padding"><?php if(!empty($address)): ?><div class="info-grid"><div class="info-cell"><div class="label">Purok/Street</div><div class="value"><?= htmlspecialchars($address['purok_street']??'—') ?></div></div><div class="info-cell"><div class="label">Barangay</div><div class="value"><?= htmlspecialchars($address['barangay']??'—') ?></div></div><div class="info-cell"><div class="label">Town/City</div><div class="value"><?= htmlspecialchars($address['town_city']??'—') ?></div></div><div class="info-cell"><div class="label">Province</div><div class="value"><?= htmlspecialchars($address['province']??'—') ?></div></div><div class="info-cell"><div class="label">Region</div><div class="value"><?= htmlspecialchars($address['region']??'—') ?></div></div><div class="info-cell"><div class="label">District</div><div class="value"><?= htmlspecialchars($address['district']??'—') ?></div></div><div class="info-cell"><div class="label">Postal Code</div><div class="value"><?= htmlspecialchars($address['postal_code']??'—') ?></div></div></div><?php else: ?><div class="p-4 text-center text-muted">No address.</div><?php endif; ?></div></div>
+        <div class="stat-card tone-blue">
+            <div class="stat-value <?= statSizeClass($stat_grade) ?>" title="<?= htmlspecialchars($stat_grade) ?>"><?= htmlspecialchars($stat_grade) ?></div>
+            <div class="stat-label">Grade</div>
+        </div>
+        <div class="stat-card tone-purple">
+            <div class="stat-value <?= statSizeClass($stat_section) ?>" title="<?= htmlspecialchars($stat_section) ?>"><?= htmlspecialchars($stat_section) ?></div>
+            <div class="stat-label">Section</div>
+        </div>
+        <div class="stat-card tone-green">
+            <div class="stat-value <?= statSizeClass($stat_strand) ?>" title="<?= htmlspecialchars($stat_strand) ?>"><?= htmlspecialchars($stat_strand) ?></div>
+            <div class="stat-label"><?= $strand_fallback ? 'Program' : 'Strand' ?></div>
+        </div>
+        <div class="stat-card tone-amber">
+            <div class="stat-value"><?= htmlspecialchars($student['age'] ?? '—') ?></div>
+            <div class="stat-label">Age</div>
+        </div>
+        <div class="stat-card tone-blue">
+            <div class="stat-value"><?= htmlspecialchars($student['sex'] ?? '—') ?></div>
+            <div class="stat-label">Sex</div>
+        </div>
+        <div class="stat-card tone-green">
+            <div class="stat-value"><?= $overall_gwa !== null ? number_format($overall_gwa, 2) : '—' ?></div>
+            <div class="stat-label">GWA</div>
         </div>
     </div>
 
-    <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-people"></i> Parents & Guardian</h3></div><div class="card-body no-padding"><?php if(!empty($parents)): ?><div class="info-grid"><div class="info-cell"><div class="label">Father Name</div><div class="value"><?= htmlspecialchars($parents['father_name']??'—') ?></div></div><div class="info-cell"><div class="label">Father Occupation</div><div class="value"><?= htmlspecialchars($parents['father_occupation']??'—') ?></div></div><div class="info-cell"><div class="label">Father Contact</div><div class="value"><?= htmlspecialchars($parents['father_contact']??'—') ?></div></div><div class="info-cell"><div class="label">Mother (Maiden)</div><div class="value"><?= htmlspecialchars($parents['mother_maiden_name']??'—') ?></div></div><div class="info-cell"><div class="label">Mother Occupation</div><div class="value"><?= htmlspecialchars($parents['mother_occupation']??'—') ?></div></div><div class="info-cell"><div class="label">Mother Contact</div><div class="value"><?= htmlspecialchars($parents['mother_contact']??'—') ?></div></div><div class="info-cell"><div class="label">Family Income</div><div class="value fw-bold"><?= $parents['ave_family_income']?'₱'.number_format($parents['ave_family_income'],2):'—' ?></div></div><div class="info-cell"><div class="label">4Ps</div><div class="value"><span class="status-dot <?= !empty($parents['is_4ps'])?'success':'danger' ?>"><?= !empty($parents['is_4ps'])?'Yes':'No' ?></span></div></div><div class="info-cell"><div class="label">Household ID</div><div class="value"><?= htmlspecialchars($parents['parent_household_id']??$parents['household_id']??'—') ?></div></div><div class="info-cell span-2" style="background:var(--bg)"><div class="label">Guardian</div><div class="value"><?= htmlspecialchars($parents['guardian_fullname']??'—') ?> (<?= htmlspecialchars($parents['guardian_relation']??'—') ?>) — <?= htmlspecialchars($parents['guardian_contact']??'—') ?></div></div></div><?php else: ?><div class="p-4 text-center text-muted">No data.</div><?php endif; ?></div></div>
+    <!-- ================= Personal + Enrollment + Address ================= -->
+    <div class="row g-3 mt-1">
+        <div class="col-lg-6">
+            <div class="card h-100">
+                <div class="card-header">
+                    <h3><i class="bi bi-person-vcard"></i> Personal Information</h3>
+                </div>
+                <div class="card-body no-padding">
+                    <div class="info-grid">
+                        <div class="info-cell"><div class="label">Birth Date</div><div class="value"><?= htmlspecialchars($student['birth_date'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Civil Status</div><div class="value"><?= htmlspecialchars($student['civil_status'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Nationality</div><div class="value"><?= htmlspecialchars($student['nationality'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Religion</div><div class="value"><?= htmlspecialchars($student['religion'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Height</div><div class="value"><?= htmlspecialchars($student['height'] ?? '—') ?> cm</div></div>
+                        <div class="info-cell"><div class="label">Weight</div><div class="value"><?= htmlspecialchars($student['weight'] ?? '—') ?> kg</div></div>
+                        <div class="info-cell"><div class="label">Email</div><div class="value"><?= htmlspecialchars($student['email'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Phone</div><div class="value"><?= htmlspecialchars($student['phone'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Nickname</div><div class="value"><?= htmlspecialchars($student['nick_name'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Extension</div><div class="value"><?= htmlspecialchars($student['ext_name'] ?? '—') ?></div></div>
+                        <div class="info-cell span-2"><div class="label">Special Skills</div><div class="value"><?= nl2br(htmlspecialchars($student['special_skills'] ?? 'None')) ?></div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="card">
+                <div class="card-header">
+                    <h3><i class="bi bi-mortarboard"></i> Enrollment Details</h3>
+                </div>
+                <div class="card-body no-padding">
+                    <?php if(!empty($enrollment)): ?>
+                    <div class="info-grid">
+                        <div class="info-cell"><div class="label">School Year</div><div class="value"><?= htmlspecialchars($enrollment['school_year'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Grade Level</div><div class="value"><?= htmlspecialchars($enrollment['grade_level'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Term</div><div class="value"><?= htmlspecialchars($enrollment['term'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Section</div><div class="value accent"><?= htmlspecialchars($enrollment['section'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Track</div><div class="value"><?= htmlspecialchars($enrollment['track'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Strand</div><div class="value"><?= htmlspecialchars($enrollment['strand'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Program</div><div class="value"><?= htmlspecialchars($enrollment['program'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Voucher Status</div><div class="value"><?= htmlspecialchars($enrollment['voucher_status'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">4Ps ID</div><div class="value"><?= htmlspecialchars($enrollment['household_id'] ?? '—') ?></div></div>
+                        <div class="info-cell">
+                            <div class="label">Status</div>
+                            <div class="value">
+                                <span class="status-dot <?= ($enrollment['status'] ?? 'Active') === 'Active' ? 'success' : 'warning' ?>">
+                                    <?= htmlspecialchars($enrollment['status'] ?? 'Active') ?>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    <?php else: ?>
+                        <div class="empty">
+                            <div class="empty-icon"><i class="bi bi-mortarboard"></i></div>
+                            <div class="empty-title">No enrollment record</div>
+                            <div class="empty-sub">This student hasn't been enrolled yet.</div>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            <div class="card mt-3">
+                <div class="card-header">
+                    <h3><i class="bi bi-geo-alt"></i> Address</h3>
+                </div>
+                <div class="card-body no-padding">
+                    <?php if(!empty($address)): ?>
+                    <div class="info-grid">
+                        <div class="info-cell"><div class="label">Purok/Street</div><div class="value"><?= htmlspecialchars($address['purok_street'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Barangay</div><div class="value"><?= htmlspecialchars($address['barangay'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Town/City</div><div class="value"><?= htmlspecialchars($address['town_city'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Province</div><div class="value"><?= htmlspecialchars($address['province'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">Region</div><div class="value"><?= htmlspecialchars($address['region'] ?? '—') ?></div></div>
+                        <div class="info-cell"><div class="label">District</div><div class="value"><?= htmlspecialchars($address['district'] ?? '—') ?></div></div>
+                        <div class="info-cell span-2"><div class="label">Postal Code</div><div class="value"><?= htmlspecialchars($address['postal_code'] ?? '—') ?></div></div>
+                    </div>
+                    <?php else: ?>
+                        <div class="empty">
+                            <div class="empty-icon"><i class="bi bi-geo-alt"></i></div>
+                            <div class="empty-title">No address</div>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+    </div>
 
+    <!-- ================= Parents & Guardian ================= -->
+    <div class="card mt-3">
+        <div class="card-header">
+            <h3><i class="bi bi-people"></i> Parents &amp; Guardian</h3>
+        </div>
+        <div class="card-body no-padding">
+            <?php if(!empty($parents)): ?>
+            <div class="info-grid">
+                <div class="info-cell"><div class="label">Father Name</div><div class="value"><?= htmlspecialchars($parents['father_name'] ?? '—') ?></div></div>
+                <div class="info-cell"><div class="label">Father Occupation</div><div class="value"><?= htmlspecialchars($parents['father_occupation'] ?? '—') ?></div></div>
+                <div class="info-cell"><div class="label">Father Contact</div><div class="value"><?= htmlspecialchars($parents['father_contact'] ?? '—') ?></div></div>
+                <div class="info-cell"><div class="label">Mother (Maiden)</div><div class="value"><?= htmlspecialchars($parents['mother_maiden_name'] ?? '—') ?></div></div>
+                <div class="info-cell"><div class="label">Mother Occupation</div><div class="value"><?= htmlspecialchars($parents['mother_occupation'] ?? '—') ?></div></div>
+                <div class="info-cell"><div class="label">Mother Contact</div><div class="value"><?= htmlspecialchars($parents['mother_contact'] ?? '—') ?></div></div>
+                <div class="info-cell"><div class="label">Family Income</div><div class="value" style="font-weight:700"><?= $parents['ave_family_income'] ? '₱' . number_format($parents['ave_family_income'], 2) : '—' ?></div></div>
+                <div class="info-cell">
+                    <div class="label">4Ps</div>
+                    <div class="value">
+                        <span class="status-dot <?= !empty($parents['is_4ps']) ? 'success' : 'danger' ?>">
+                            <?= !empty($parents['is_4ps']) ? 'Yes' : 'No' ?>
+                        </span>
+                    </div>
+                </div>
+                <div class="info-cell"><div class="label">Household ID</div><div class="value"><?= htmlspecialchars($parents['parent_household_id'] ?? $parents['household_id'] ?? '—') ?></div></div>
+                <div class="info-cell span-full">
+                    <div class="label">Guardian</div>
+                    <div class="value">
+                        <?= htmlspecialchars($parents['guardian_fullname'] ?? '—') ?>
+                        <?php if (!empty($parents['guardian_relation'])): ?>
+                            <span style="color:var(--text-2);font-weight:500"> (<?= htmlspecialchars($parents['guardian_relation']) ?>)</span>
+                        <?php endif; ?>
+                        <?php if (!empty($parents['guardian_contact'])): ?>
+                            <span style="color:var(--text-3)"> — </span><?= htmlspecialchars($parents['guardian_contact']) ?>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+            <?php else: ?>
+                <div class="empty">
+                    <div class="empty-icon"><i class="bi bi-people"></i></div>
+                    <div class="empty-title">No parent/guardian data</div>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ================= Required Documents ================= -->
     <div class="card mt-3">
         <div class="card-header">
             <h3>
                 <i class="bi bi-file-earmark-check"></i> Required Documents
                 <?php if($docs_total > 0): ?>
-                    <span class="badge-pill <?= $docs_ok === $docs_total ? 'success' : 'primary' ?> ms-2"><?= $docs_ok ?> / <?= $docs_total ?> Submitted</span>
+                    <span class="pill <?= $docs_ok === $docs_total ? 'success' : 'primary' ?>" style="margin-left:.5rem">
+                        <?= $docs_ok ?> / <?= $docs_total ?> Submitted
+                    </span>
                 <?php endif; ?>
             </h3>
         </div>
         <div class="card-body no-padding">
             <?php if(!empty($documents)): ?>
-            <table class="table-admin">
-                <thead><tr><th>Document</th><th width="110">Status</th><th>File</th><th width="170" style="text-align:right">Action</th></tr></thead>
-                <tbody>
-                <?php foreach($documents as $d):
-                    $hasBlob  = !empty($d['has_blob']);
-                    $hasPath  = !empty($d['file_path']) && file_exists(document_abs_path($d['file_path']));
-                    $ok       = !empty($d['submitted']) && ($hasBlob || $hasPath);
+                <div class="table-scroll">
+                    <table class="table-admin">
+                        <thead>
+                            <tr>
+                                <th>Document</th>
+                                <th style="width:120px">Status</th>
+                                <th>File</th>
+                                <th style="width:170px;text-align:right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach($documents as $d):
+                            $hasBlob  = !empty($d['has_blob']);
+                            $hasPath  = !empty($d['file_path']) && file_exists(document_abs_path($d['file_path']));
+                            $ok       = !empty($d['submitted']) && ($hasBlob || $hasPath);
 
-                    if ($hasPath) { $size = filesize(document_abs_path($d['file_path'])); }
-                    elseif ($hasBlob) { $size = (int)$d['blob_size']; }
-                    else { $size = 0; }
+                            if ($hasPath) { $size = filesize(document_abs_path($d['file_path'])); }
+                            elseif ($hasBlob) { $size = (int)$d['blob_size']; }
+                            else { $size = 0; }
 
-                    if (!empty($d['file_name'])) { $fname = $d['file_name']; }
-                    elseif ($hasPath) { $fname = basename($d['file_path']); }
-                    else { $fname = 'document'; }
+                            if (!empty($d['file_name'])) { $fname = $d['file_name']; }
+                            elseif ($hasPath) { $fname = basename($d['file_path']); }
+                            else { $fname = 'document'; }
 
-                    $probe    = $hasPath ? $d['file_path'] : $fname;
-                    $isImage  = $ok && preg_match('/\.(jpe?g|png|gif|webp)$/i', $probe);
-                    $isPdf    = $ok && preg_match('/\.pdf$/i', $probe);
-                    $source   = $hasBlob ? 'stored in database' : ($hasPath ? 'stored on disk' : '');
-                ?>
-                    <tr>
-                        <td><i class="bi bi-file-earmark-text me-2 text-muted"></i> <?= htmlspecialchars($d['document_name']) ?></td>
-                        <td>
-                            <?php if($ok): ?><span class="status-dot success">Submitted</span>
-                            <?php elseif(!empty($d['submitted']) && !$ok): ?><span class="status-dot danger" title="Record exists but the file is missing">File lost</span>
-                            <?php else: ?><span class="status-dot danger">Missing</span><?php endif; ?>
-                        </td>
-                        <td class="small">
-                            <?php if($ok): ?>
-                                <div class="fw-semibold text-truncate" style="max-width:280px" title="<?= htmlspecialchars($fname) ?>">
-                                    <?php if($isImage): ?><i class="bi bi-file-earmark-image me-1"></i>
-                                    <?php elseif($isPdf): ?><i class="bi bi-file-earmark-pdf me-1"></i>
-                                    <?php else: ?><i class="bi bi-file-earmark me-1"></i><?php endif; ?>
-                                    <?= htmlspecialchars($fname) ?>
-                                </div>
-                                <div class="text-muted" style="font-size:0.72rem">
-                                    <?= number_format($size / 1024, 1) ?> KB
-                                    <?php if(!empty($d['uploaded_at'])): ?> · <?= date('M d, Y g:i A', strtotime($d['uploaded_at'])) ?><?php endif; ?>
-                                    <?php if(!empty($d['uploader_name'])): ?> · by <?= htmlspecialchars($d['uploader_name']) ?><?php endif; ?>
-                                    <?php if($source): ?> · <?= $source ?><?php endif; ?>
-                                </div>
-                            <?php else: ?><span class="text-muted">—</span><?php endif; ?>
-                        </td>
-                        <td style="text-align:right">
-                            <?php if($ok): ?>
-                                <div class="btn-group-actions" style="justify-content:flex-end">
-                                    <a href="document.php?id=<?= $d['entrance_id'] ?>" class="btn btn-icon btn-outline-primary" target="_blank" title="View"><i class="bi bi-eye"></i></a>
-                                    <a href="document.php?id=<?= $d['entrance_id'] ?>&mode=download" class="btn btn-icon btn-outline-secondary" title="Download"><i class="bi bi-download"></i></a>
-                                    <button class="btn btn-icon btn-outline-danger delete-doc-btn" data-eid="<?= $d['entrance_id'] ?>" data-name="<?= htmlspecialchars($d['document_name']) ?>" title="Delete"><i class="bi bi-trash3"></i></button>
-                                </div>
-                            <?php else: ?>
-                                <button class="btn btn-primary btn-xs upload-doc-btn" data-eid="<?= $d['entrance_id'] ?>" data-name="<?= htmlspecialchars($d['document_name']) ?>"><i class="bi bi-upload me-1"></i> Upload</button>
-                            <?php endif; ?>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
+                            $probe    = $hasPath ? $d['file_path'] : $fname;
+                            $isImage  = $ok && preg_match('/\.(jpe?g|png|gif|webp)(\.enc)?$/i', $probe);
+                            $isPdf    = $ok && preg_match('/\.pdf(\.enc)?$/i', $probe);
+                            $source   = $hasBlob ? 'in database' : ($hasPath ? 'encrypted on disk' : '');
+                        ?>
+                            <tr>
+                                <td>
+                                    <div class="file-name">
+                                        <i class="bi bi-file-earmark-text"></i>
+                                        <?= htmlspecialchars($d['document_name']) ?>
+                                    </div>
+                                </td>
+                                <td>
+                                    <?php if($ok): ?>
+                                        <span class="status-dot success">Submitted</span>
+                                    <?php elseif(!empty($d['submitted']) && !$ok): ?>
+                                        <span class="status-dot warning" title="Record exists but the file is missing">File lost</span>
+                                    <?php else: ?>
+                                        <span class="status-dot danger">Missing</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if($ok): ?>
+                                        <div class="file-name" title="<?= htmlspecialchars($fname) ?>">
+                                            <?php if($isImage): ?><i class="bi bi-file-earmark-image"></i>
+                                            <?php elseif($isPdf): ?><i class="bi bi-file-earmark-pdf"></i>
+                                            <?php else: ?><i class="bi bi-file-earmark"></i><?php endif; ?>
+                                            <?= htmlspecialchars($fname) ?>
+                                        </div>
+                                        <div class="file-meta">
+                                            <span><?= number_format($size / 1024, 1) ?> KB</span>
+                                            <?php if(!empty($d['uploaded_at'])): ?><span class="dot">·</span><span><?= date('M d, Y g:i A', strtotime($d['uploaded_at'])) ?></span><?php endif; ?>
+                                            <?php if(!empty($d['uploader_name'])): ?><span class="dot">·</span><span>by <?= htmlspecialchars($d['uploader_name']) ?></span><?php endif; ?>
+                                            <?php if($source): ?><span class="dot">·</span><span><?= $source ?></span><?php endif; ?>
+                                        </div>
+                                    <?php else: ?>
+                                        <span class="cell-muted">—</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td style="text-align:right">
+                                    <?php if($ok): ?>
+                                        <div class="btn-group-actions" style="justify-content:flex-end">
+                                            <a href="view_document.php?id=<?= (int)$d['entrance_id'] ?>"
+                                               class="btn btn-icon btn-outline-primary" target="_blank" title="View">
+                                                <i class="bi bi-eye"></i>
+                                            </a>
+                                            <a href="view_document.php?id=<?= (int)$d['entrance_id'] ?>&dl=1"
+                                               class="btn btn-icon btn-outline-secondary" title="Download">
+                                                <i class="bi bi-download"></i>
+                                            </a>
+                                            <button class="btn btn-icon btn-outline-danger delete-doc-btn"
+                                                    data-eid="<?= (int)$d['entrance_id'] ?>"
+                                                    data-name="<?= htmlspecialchars($d['document_name']) ?>"
+                                                    title="Delete">
+                                                <i class="bi bi-trash3"></i>
+                                            </button>
+                                        </div>
+                                    <?php else: ?>
+                                        <button class="btn btn-primary btn-xs upload-doc-btn"
+                                                data-eid="<?= (int)$d['entrance_id'] ?>"
+                                                data-name="<?= htmlspecialchars($d['document_name']) ?>">
+                                            <i class="bi bi-upload me-1"></i> Upload
+                                        </button>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
             <?php else: ?>
-                <div class="p-4 text-center text-muted"><i class="bi bi-file-earmark display-4 d-block mb-3"></i>No documents configured for this student.</div>
+                <div class="empty">
+                    <div class="empty-icon"><i class="bi bi-file-earmark"></i></div>
+                    <div class="empty-title">No documents configured</div>
+                    <div class="empty-sub">Documents are created automatically when this page loads.</div>
+                </div>
             <?php endif; ?>
         </div>
     </div>
 
-    <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-book"></i> Educational History</h3><button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addEducationModal"><i class="bi bi-plus-lg me-1"></i> Add</button></div><div class="card-body no-padding"><?php if(!empty($education)): ?><table class="table-admin"><thead><tr><th>Level</th><th>School Name</th><th>Address</th><th width="80">Year</th><th width="100" style="text-align:right">Action</th></tr></thead><tbody><?php foreach($education as $e): ?><tr><td class="fw-semibold"><?= htmlspecialchars($e['level']) ?></td><td><?= htmlspecialchars($e['school_name']) ?></td><td><?= htmlspecialchars($e['school_address']??'—') ?></td><td><?= htmlspecialchars($e['year_completed']??'—') ?></td><td style="text-align:right"><div class="btn-group-actions" style="justify-content:flex-end"><button class="btn btn-icon btn-outline-warning edit-edu-btn" data-bs-toggle="modal" data-bs-target="#editEducationModal" data-id="<?= $e['edu_id'] ?>" data-lvl="<?= htmlspecialchars($e['level']) ?>" data-sch="<?= htmlspecialchars($e['school_name']) ?>" data-adr="<?= htmlspecialchars($e['school_address']??'') ?>" data-yr="<?= htmlspecialchars($e['year_completed']??'') ?>"><i class="bi bi-pencil"></i></button><button class="btn btn-icon btn-outline-danger del-edu-btn" data-id="<?= $e['edu_id'] ?>" data-sch="<?= htmlspecialchars($e['school_name']) ?>"><i class="bi bi-trash3"></i></button></div></td></tr><?php endforeach; ?></tbody></table><?php else: ?><div class="p-4 text-center text-muted">No records.</div><?php endif; ?></div></div>
-
-    <div class="card mt-3"><div class="card-header"><h3><i class="bi bi-journal-text"></i> Academic Record & Grades</h3><div class="d-flex gap-2"><?php if($overall_gwa!==null): ?><span class="badge-pill primary">Overall GWA: <strong><?= number_format($overall_gwa,2) ?></strong></span><?php endif; ?><button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addGradeModal"><i class="bi bi-plus-lg me-1"></i> Add Grade</button></div></div><div class="card-body no-padding">
-        <?php if(!empty($academic_record)): ?>
-        <?php
-        $termColors = [
-            '1st Term' => ['bg'=>'#eef2ff','text'=>'#4338ca','border'=>'#c7d2fe'],
-            '2nd Term' => ['bg'=>'#dbeafe','text'=>'#1e40af','border'=>'#93c5fd'],
-            '3rd Term' => ['bg'=>'#ede9fe','text'=>'#6d28d9','border'=>'#c4b5fd'],
-            'Unknown Term' => ['bg'=>'#f1f5f9','text'=>'#64748b','border'=>'#e2e8f0'],
-        ];
-        foreach($academic_record as $school_year => $grade_levels): ?>
-        <div>
-            <div class="academic-sy-header"><div class="d-flex justify-content-between align-items-center"><h6 class="fw-bold mb-0" style="color:var(--accent)"><i class="bi bi-calendar-range me-2"></i>SY: <?= htmlspecialchars($school_year) ?></h6><?php if(isset($gwa_per_year[$school_year])): ?><span class="badge-pill primary">SY GWA: <?= number_format($gwa_per_year[$school_year],2) ?></span><?php endif; ?></div></div>
-            <?php foreach($grade_levels as $grade_level => $terms_in_level): ?>
-            <div class="px-4 py-2" style="background:rgba(79,70,229,0.04);border-bottom:1px solid var(--border)"><h6 class="fw-bold mb-0 small"><i class="bi bi-mortarboard me-2"></i><?= htmlspecialchars($grade_level) ?></h6></div>
-            <?php foreach($terms_in_level as $term => $subjects):
-                $tg = $term_gwa[$school_year][$grade_level][$term] ?? null;
-                $tc = $termColors[$term] ?? $termColors['Unknown Term'];
-            ?>
-            <div class="term-group" style="background:<?= $tc['bg'] ?>;border-color:<?= $tc['border'] ?>">
-                <div class="d-flex justify-content-between align-items-center mb-2">
-                    <span class="fw-bold small" style="color:<?= $tc['text'] ?>"><i class="bi bi-caret-right-fill me-1"></i><?= htmlspecialchars($term) ?> (<?= count($subjects) ?>)</span>
-                    <?php if($tg !== null): ?><span class="badge-pill" style="background:white;color:<?= $tc['text'] ?>;font-size:0.7rem">Term GWA: <?= number_format($tg,2) ?></span><?php endif; ?>
-                </div>
-                <table class="table-admin" style="background:white;border-radius:8px;overflow:hidden;font-size:0.78rem">
-                    <thead><tr><th width="80">Code</th><th>Subject</th><th width="70">Grade</th><th width="100">Remarks</th><th width="70" style="text-align:right">Action</th></tr></thead>
-                    <tbody>
-                    <?php foreach($subjects as $g): ?>
-                        <tr>
-                            <td class="fw-semibold small"><?= htmlspecialchars($g['subject_code']) ?></td>
-                            <td><?= htmlspecialchars($g['subject_name']) ?></td>
-                            <td class="fw-bold <?= ($g['grade']??0)>=75?'text-success':'text-danger' ?>"><?= $g['grade']!==null?number_format($g['grade'],2):'—' ?></td>
-                            <td class="small"><?= htmlspecialchars($g['remarks']??'—') ?></td>
-                            <td style="text-align:right"><div class="btn-group-actions" style="justify-content:flex-end">
-                                <button class="btn btn-icon btn-outline-warning edit-grd-btn" data-bs-toggle="modal" data-bs-target="#editGradeModal" data-id="<?= $g['grade_id'] ?>" data-term="<?= htmlspecialchars($g['term']) ?>" data-code="<?= htmlspecialchars($g['subject_code']) ?>" data-name="<?= htmlspecialchars($g['subject_name']) ?>" data-grd="<?= $g['grade']??'' ?>" data-rem="<?= htmlspecialchars($g['remarks']??'') ?>"><i class="bi bi-pencil"></i></button>
-                                <button class="btn btn-icon btn-outline-danger del-grd-btn" data-id="<?= $g['grade_id'] ?>" data-name="<?= htmlspecialchars($g['subject_name']) ?>"><i class="bi bi-trash3"></i></button>
-                            </div></td>
-                        </tr>
-                    <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-            <?php endforeach; ?>
-            <?php endforeach; ?>
+    <!-- ================= Educational History ================= -->
+    <div class="card mt-3">
+        <div class="card-header">
+            <h3><i class="bi bi-book"></i> Educational History</h3>
+            <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addEducationModal">
+                <i class="bi bi-plus-lg me-1"></i> Add
+            </button>
         </div>
-        <?php endforeach; ?>
-        <?php else: ?>
-            <div class="p-4 text-center text-muted"><i class="bi bi-journal-text display-4 d-block mb-3"></i>No grades recorded yet.</div>
-        <?php endif; ?>
-    </div></div>
+        <div class="card-body no-padding">
+            <?php if(!empty($education)): ?>
+                <div class="table-scroll">
+                    <table class="table-admin">
+                        <thead>
+                            <tr>
+                                <th>Level</th>
+                                <th>School Name</th>
+                                <th>Address</th>
+                                <th style="width:90px">Year</th>
+                                <th style="width:100px;text-align:right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        <?php foreach($education as $e): ?>
+                            <tr>
+                                <td class="cell-strong"><?= htmlspecialchars($e['level']) ?></td>
+                                <td><?= htmlspecialchars($e['school_name']) ?></td>
+                                <td class="cell-muted"><?= htmlspecialchars($e['school_address'] ?? '—') ?></td>
+                                <td class="cell-muted"><?= htmlspecialchars($e['year_completed'] ?? '—') ?></td>
+                                <td style="text-align:right">
+                                    <div class="btn-group-actions" style="justify-content:flex-end">
+                                        <button class="btn btn-icon btn-outline-warning edit-edu-btn"
+                                                data-bs-toggle="modal" data-bs-target="#editEducationModal"
+                                                data-id="<?= (int)$e['edu_id'] ?>"
+                                                data-lvl="<?= htmlspecialchars($e['level']) ?>"
+                                                data-sch="<?= htmlspecialchars($e['school_name']) ?>"
+                                                data-adr="<?= htmlspecialchars($e['school_address'] ?? '') ?>"
+                                                data-yr="<?= htmlspecialchars($e['year_completed'] ?? '') ?>"
+                                                title="Edit">
+                                            <i class="bi bi-pencil"></i>
+                                        </button>
+                                        <button class="btn btn-icon btn-outline-danger del-edu-btn"
+                                                data-id="<?= (int)$e['edu_id'] ?>"
+                                                data-sch="<?= htmlspecialchars($e['school_name']) ?>"
+                                                title="Delete">
+                                            <i class="bi bi-trash3"></i>
+                                        </button>
+                                    </div>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            <?php else: ?>
+                <div class="empty">
+                    <div class="empty-icon"><i class="bi bi-book"></i></div>
+                    <div class="empty-title">No records</div>
+                    <div class="empty-sub">Add educational background for this student.</div>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ================= Academic Record & Grades ================= -->
+    <div class="card mt-3">
+        <div class="card-header">
+            <h3><i class="bi bi-journal-text"></i> Academic Record &amp; Grades</h3>
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+                <?php if($overall_gwa !== null): ?>
+                    <span class="pill primary">
+                        Overall GWA: <strong style="margin-left:.2rem"><?= number_format($overall_gwa, 2) ?></strong>
+                    </span>
+                <?php endif; ?>
+                <button class="btn btn-primary btn-sm" data-bs-toggle="modal" data-bs-target="#addGradeModal">
+                    <i class="bi bi-plus-lg me-1"></i> Add Grade
+                </button>
+            </div>
+        </div>
+        <div class="card-body no-padding">
+            <?php if(!empty($academic_record)): ?>
+                <?php
+                $termClass = [
+                    '1st Term'     => 'term-1',
+                    '2nd Term'     => 'term-2',
+                    '3rd Term'     => 'term-3',
+                    'Unknown Term' => '',
+                ];
+                foreach($academic_record as $school_year => $grade_levels): ?>
+                <div>
+                    <div class="sy-header">
+                        <h6><i class="bi bi-calendar-range"></i> School Year <?= htmlspecialchars($school_year) ?></h6>
+                        <?php if(isset($gwa_per_year[$school_year])): ?>
+                            <span class="pill primary">SY GWA: <?= number_format($gwa_per_year[$school_year], 2) ?></span>
+                        <?php endif; ?>
+                    </div>
+
+                    <?php foreach($grade_levels as $grade_level => $terms_in_level): ?>
+                        <div class="grade-level-band">
+                            <h6><i class="bi bi-mortarboard"></i> <?= htmlspecialchars($grade_level) ?></h6>
+                        </div>
+
+                        <?php foreach($terms_in_level as $term => $subjects):
+                            $tg = $term_gwa[$school_year][$grade_level][$term] ?? null;
+                            $tc = $termClass[$term] ?? '';
+                        ?>
+                        <div class="term-block <?= $tc ?>">
+                            <div class="term-head">
+                                <span class="term-title">
+                                    <i class="bi bi-caret-right-fill"></i>
+                                    <?= htmlspecialchars($term) ?>
+                                    <span style="color:var(--text-2);font-weight:500;margin-left:.25rem">
+                                        (<?= count($subjects) ?>)
+                                    </span>
+                                </span>
+                                <?php if($tg !== null): ?>
+                                    <span class="term-gwa">Term GWA: <?= number_format($tg, 2) ?></span>
+                                <?php endif; ?>
+                            </div>
+                            <div class="table-scroll">
+                                <table class="table-admin">
+                                    <thead>
+                                        <tr>
+                                            <th style="width:90px">Code</th>
+                                            <th>Subject</th>
+                                            <th style="width:80px">Grade</th>
+                                            <th style="width:120px">Remarks</th>
+                                            <th style="width:90px;text-align:right">Action</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                    <?php foreach($subjects as $g): ?>
+                                        <tr>
+                                            <td class="cell-strong"><?= htmlspecialchars($g['subject_code']) ?></td>
+                                            <td><?= htmlspecialchars($g['subject_name']) ?></td>
+                                            <td class="<?= ($g['grade'] ?? 0) >= 75 ? 'grade-pass' : 'grade-fail' ?>">
+                                                <?= $g['grade'] !== null ? number_format($g['grade'], 2) : '—' ?>
+                                            </td>
+                                            <td class="cell-muted"><?= htmlspecialchars($g['remarks'] ?? '—') ?></td>
+                                            <td style="text-align:right">
+                                                <div class="btn-group-actions" style="justify-content:flex-end">
+                                                    <button class="btn btn-icon btn-outline-warning edit-grd-btn"
+                                                            data-bs-toggle="modal" data-bs-target="#editGradeModal"
+                                                            data-id="<?= (int)$g['grade_id'] ?>"
+                                                            data-term="<?= htmlspecialchars($g['term']) ?>"
+                                                            data-code="<?= htmlspecialchars($g['subject_code']) ?>"
+                                                            data-name="<?= htmlspecialchars($g['subject_name']) ?>"
+                                                            data-grd="<?= $g['grade'] ?? '' ?>"
+                                                            data-rem="<?= htmlspecialchars($g['remarks'] ?? '') ?>"
+                                                            title="Edit">
+                                                        <i class="bi bi-pencil"></i>
+                                                    </button>
+                                                    <button class="btn btn-icon btn-outline-danger del-grd-btn"
+                                                            data-id="<?= (int)$g['grade_id'] ?>"
+                                                            data-name="<?= htmlspecialchars($g['subject_name']) ?>"
+                                                            title="Delete">
+                                                        <i class="bi bi-trash3"></i>
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <?php endforeach; ?>
+                    <?php endforeach; ?>
+                </div>
+                <?php endforeach; ?>
+            <?php else: ?>
+                <div class="empty">
+                    <div class="empty-icon"><i class="bi bi-journal-text"></i></div>
+                    <div class="empty-title">No grades recorded yet</div>
+                    <div class="empty-sub">Add the student's first grade to begin tracking.</div>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
 </div>
 
-<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
+<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(2px);z-index:199"
+     onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
 
-<!-- MODALS -->
-<div class="modal fade" id="uploadPhotoModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-camera me-2"></i>Change Photo</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST" enctype="multipart/form-data"><div class="modal-body"><input type="hidden" name="upload_photo" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="file" name="student_photo" class="form-control" accept="image/*" required></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm">Upload</button></div></form></div></div></div>
-<div class="modal fade" id="uploadDocumentModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-cloud-upload me-2"></i>Upload Document</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="docForm" enctype="multipart/form-data"><input type="hidden" name="upload_document" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="hidden" name="entrance_id" id="m_eid"><p class="fw-semibold small mb-2" id="m_dname"></p><input type="file" name="document_file" id="m_file" class="form-control" required><div id="m_msg" class="mt-2"></div><div class="text-muted small mt-2">Max 5 MB · PDF, JPG, PNG, DOC, DOCX</div></form></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="btnUpDoc">Upload</button></div></div></div></div>
-<div class="modal fade" id="deleteDocModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Document</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p>Delete <strong id="del_dname"></strong>?</p></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><form method="POST"><input type="hidden" name="delete_document" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input type="hidden" name="entrance_id" id="del_eid"><button class="btn btn-danger btn-sm">Delete</button></form></div></div></div></div>
-<div class="modal fade" id="deleteStudentModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Student</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p class="mb-0">Permanently delete <strong><?= $fullName ?></strong> and all records?</p></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><form method="POST"><input type="hidden" name="delete_student" value="1"><input type="hidden" name="student_id" value="<?= $student_id ?>"><button class="btn btn-danger btn-sm">Delete</button></form></div></div></div></div>
-<div class="modal fade" id="addGradeModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-plus-circle me-2"></i>Add Grade</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST"><div class="modal-body"><input type="hidden" name="student_id" value="<?= $student_id ?>"><select name="term" class="form-select form-select-sm mb-2" required><option value="" disabled>Select Term</option><?php foreach($terms as $term): ?><option value="<?= htmlspecialchars($term) ?>" <?= $currentTerm === $term ? 'selected' : '' ?>><?= htmlspecialchars($term) ?></option><?php endforeach; ?></select><input name="subject_code" class="form-control form-control-sm mb-2" placeholder="Subject Code" required><input name="subject_name" class="form-control form-control-sm mb-2" placeholder="Subject Name" required><input type="number" step="0.01" name="grade" class="form-control form-control-sm mb-2" placeholder="Grade"><input name="remarks" class="form-control form-control-sm" placeholder="Remarks"></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button name="add_grade" class="btn btn-primary btn-sm">Save</button></div></form></div></div></div>
-<div class="modal fade" id="editGradeModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-pencil me-2"></i>Edit Grade</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST"><div class="modal-body"><input type="hidden" name="grade_id" id="eg_id"><input type="hidden" name="student_id" value="<?= $student_id ?>"><select name="term" id="eg_term" class="form-select form-select-sm mb-2" required><option value="">Select Term</option><?php foreach($terms as $term): ?><option value="<?= htmlspecialchars($term) ?>"><?= htmlspecialchars($term) ?></option><?php endforeach; ?></select><input name="subject_code" id="eg_code" class="form-control form-control-sm mb-2" required><input name="subject_name" id="eg_name" class="form-control form-control-sm mb-2" required><input type="number" step="0.01" name="grade" id="eg_grd" class="form-control form-control-sm mb-2"><input name="remarks" id="eg_rem" class="form-control form-control-sm"></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button name="edit_grade" class="btn btn-primary btn-sm">Update</button></div></form></div></div></div>
-<div class="modal fade" id="deleteGradeModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-trash3 me-2"></i>Delete Grade</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p>Delete <strong id="dg_name"></strong>?</p></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><form method="POST"><input type="hidden" name="grade_id" id="dg_id"><input type="hidden" name="student_id" value="<?= $student_id ?>"><button name="delete_grade" class="btn btn-danger btn-sm">Delete</button></form></div></div></div></div>
-<div class="modal fade" id="addEducationModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-plus-circle me-2"></i>Add Education</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST"><div class="modal-body"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input name="level" class="form-control form-control-sm mb-2" placeholder="Level" required><input name="school_name" class="form-control form-control-sm mb-2" placeholder="School Name" required><input name="school_address" class="form-control form-control-sm mb-2" placeholder="Address"><input name="year_completed" class="form-control form-control-sm" placeholder="Year"></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button name="add_education" class="btn btn-primary btn-sm">Save</button></div></form></div></div></div>
-<div class="modal fade" id="editEducationModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header"><h6 class="modal-title fw-bold"><i class="bi bi-pencil me-2"></i>Edit Education</h6><button class="btn-close" data-bs-dismiss="modal"></button></div><form method="POST"><div class="modal-body"><input type="hidden" name="edu_id" id="ee_id"><input type="hidden" name="student_id" value="<?= $student_id ?>"><input name="level" id="ee_lvl" class="form-control form-control-sm mb-2" required><input name="school_name" id="ee_sch" class="form-control form-control-sm mb-2" required><input name="school_address" id="ee_adr" class="form-control form-control-sm mb-2"><input name="year_completed" id="ee_yr" class="form-control form-control-sm"></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button name="edit_education" class="btn btn-primary btn-sm">Update</button></div></form></div></div></div>
-<div class="modal fade" id="deleteEducationModal" tabindex="-1"><div class="modal-dialog modal-sm modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header bg-danger text-white"><h6 class="modal-title fw-bold"><i class="bi bi-trash3 me-2"></i>Delete Education</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><p>Delete <strong id="de_sch"></strong>?</p></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><form method="POST"><input type="hidden" name="edu_id" id="de_id"><input type="hidden" name="student_id" value="<?= $student_id ?>"><button name="delete_education" class="btn btn-danger btn-sm">Delete</button></form></div></div></div></div>
+<!-- ================= MODALS ================= -->
+
+<!-- Upload photo -->
+<div class="modal fade" id="uploadPhotoModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold"><i class="bi bi-camera me-2"></i>Change Photo</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" enctype="multipart/form-data">
+                <div class="modal-body">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="upload_photo" value="1">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <input type="file" name="student_photo" class="form-control" accept="image/*" required>
+                    <div class="form-text mt-2">JPG or PNG · Max 2 MB</div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button class="btn btn-primary btn-sm">Upload</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Upload document -->
+<div class="modal fade" id="uploadDocumentModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold"><i class="bi bi-cloud-upload me-2"></i>Upload Document</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="docForm" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="upload_document" value="1">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <input type="hidden" name="entrance_id" id="m_eid">
+                    <p class="fw-semibold small mb-2" id="m_dname" style="color:var(--text)"></p>
+                    <input type="file" name="document_file" id="m_file" class="form-control" required>
+                    <div id="m_msg" class="mt-2"></div>
+                    <div class="form-text mt-2">Max 5 MB · PDF, JPG, PNG · Encrypted at rest</div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <button class="btn btn-primary btn-sm" id="btnUpDoc">Upload</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Delete document -->
+<div class="modal fade" id="deleteDocModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header bg-danger text-white">
+                <h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Document</h6>
+                <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>Delete <strong id="del_dname"></strong>? This cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <form method="POST" class="m-0">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="delete_document" value="1">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <input type="hidden" name="entrance_id" id="del_eid">
+                    <button class="btn btn-danger btn-sm">Delete</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Delete student -->
+<div class="modal fade" id="deleteStudentModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header bg-danger text-white">
+                <h6 class="modal-title fw-bold"><i class="bi bi-exclamation-triangle me-2"></i>Delete Student</h6>
+                <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-0">Permanently delete <strong><?= $fullName ?></strong> and all related records? This cannot be undone.</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <form method="POST" class="m-0">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="delete_student" value="1">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <button class="btn btn-danger btn-sm">Delete</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add grade -->
+<div class="modal fade" id="addGradeModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold"><i class="bi bi-plus-circle me-2"></i>Add Grade</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST">
+                <div class="modal-body">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <select name="term" class="form-select form-select-sm mb-2" required>
+                        <option value="" disabled>Select Term</option>
+                        <?php foreach($terms as $term): ?>
+                            <option value="<?= htmlspecialchars($term) ?>" <?= $currentTerm === $term ? 'selected' : '' ?>><?= htmlspecialchars($term) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <input name="subject_code" class="form-control form-control-sm mb-2" placeholder="Subject Code" required>
+                    <input name="subject_name" class="form-control form-control-sm mb-2" placeholder="Subject Name" required>
+                    <input type="number" step="0.01" name="grade" class="form-control form-control-sm mb-2" placeholder="Grade">
+                    <input name="remarks" class="form-control form-control-sm" placeholder="Remarks">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button name="add_grade" class="btn btn-primary btn-sm">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Edit grade -->
+<div class="modal fade" id="editGradeModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold"><i class="bi bi-pencil me-2"></i>Edit Grade</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST">
+                <div class="modal-body">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="grade_id" id="eg_id">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <select name="term" id="eg_term" class="form-select form-select-sm mb-2" required>
+                        <option value="">Select Term</option>
+                        <?php foreach($terms as $term): ?>
+                            <option value="<?= htmlspecialchars($term) ?>"><?= htmlspecialchars($term) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <input name="subject_code" id="eg_code" class="form-control form-control-sm mb-2" required>
+                    <input name="subject_name" id="eg_name" class="form-control form-control-sm mb-2" required>
+                    <input type="number" step="0.01" name="grade" id="eg_grd" class="form-control form-control-sm mb-2">
+                    <input name="remarks" id="eg_rem" class="form-control form-control-sm">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button name="edit_grade" class="btn btn-primary btn-sm">Update</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Delete grade -->
+<div class="modal fade" id="deleteGradeModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header bg-danger text-white">
+                <h6 class="modal-title fw-bold"><i class="bi bi-trash3 me-2"></i>Delete Grade</h6>
+                <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>Delete <strong id="dg_name"></strong>?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <form method="POST" class="m-0">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="grade_id" id="dg_id">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <button name="delete_grade" class="btn btn-danger btn-sm">Delete</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add education -->
+<div class="modal fade" id="addEducationModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold"><i class="bi bi-plus-circle me-2"></i>Add Education</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST">
+                <div class="modal-body">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <input name="level" class="form-control form-control-sm mb-2" placeholder="Level" required>
+                    <input name="school_name" class="form-control form-control-sm mb-2" placeholder="School Name" required>
+                    <input name="school_address" class="form-control form-control-sm mb-2" placeholder="Address">
+                    <input name="year_completed" class="form-control form-control-sm" placeholder="Year">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button name="add_education" class="btn btn-primary btn-sm">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Edit education -->
+<div class="modal fade" id="editEducationModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title fw-bold"><i class="bi bi-pencil me-2"></i>Edit Education</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST">
+                <div class="modal-body">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="edu_id" id="ee_id">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <input name="level" id="ee_lvl" class="form-control form-control-sm mb-2" required>
+                    <input name="school_name" id="ee_sch" class="form-control form-control-sm mb-2" required>
+                    <input name="school_address" id="ee_adr" class="form-control form-control-sm mb-2">
+                    <input name="year_completed" id="ee_yr" class="form-control form-control-sm">
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                    <button name="edit_education" class="btn btn-primary btn-sm">Update</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Delete education -->
+<div class="modal fade" id="deleteEducationModal" tabindex="-1">
+    <div class="modal-dialog modal-sm modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header bg-danger text-white">
+                <h6 class="modal-title fw-bold"><i class="bi bi-trash3 me-2"></i>Delete Education</h6>
+                <button class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p>Delete <strong id="de_sch"></strong>?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <form method="POST" class="m-0">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="edu_id" id="de_id">
+                    <input type="hidden" name="student_id" value="<?= (int)$student_id ?>">
+                    <button name="delete_education" class="btn btn-danger btn-sm">Delete</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
 <script>
-const sb=document.getElementById('sidebar'),ov=document.getElementById('sidebarOverlay');
-document.getElementById('menuToggle').addEventListener('click',()=>{sb.classList.toggle('open');ov.style.display=sb.classList.contains('open')?'block':'none'});
-const tb=document.getElementById('themeToggle'),ti=document.getElementById('themeIcon'),h=document.documentElement;
-function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
-(function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();
-tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
-$('.upload-doc-btn').click(function(){$('#m_eid').val($(this).data('eid'));$('#m_dname').text($(this).data('name'));$('#m_msg').html('');$('#m_file').val('');$('#uploadDocumentModal').modal('show')});
-$('.delete-doc-btn').click(function(){$('#del_eid').val($(this).data('eid'));$('#del_dname').text($(this).data('name'));$('#deleteDocModal').modal('show')});
-$('#btnUpDoc').click(function(){var f=new FormData($('#docForm')[0]);$.ajax({url:'view_student.php',type:'POST',data:f,contentType:false,processData:false,beforeSend:function(){$('#btnUpDoc').prop('disabled',true).html('<span class="spinner-border spinner-border-sm"></span>')},success:function(){location.reload()},error:function(){$('#m_msg').html('<div class="alert alert-danger py-1 small mt-2">Upload failed.</div>');$('#btnUpDoc').prop('disabled',false).html('Upload')}})});
-$('.edit-grd-btn').click(function(){var b=$(this);$('#eg_id').val(b.data('id'));$('#eg_term').val(b.data('term'));$('#eg_code').val(b.data('code'));$('#eg_name').val(b.data('name'));$('#eg_grd').val(b.data('grd'));$('#eg_rem').val(b.data('rem'))});
-$('.del-grd-btn').click(function(){var b=$(this);$('#dg_id').val(b.data('id'));$('#dg_name').text(b.data('name'));$('#deleteGradeModal').modal('show')});
-$('.edit-edu-btn').click(function(){var b=$(this);$('#ee_id').val(b.data('id'));$('#ee_lvl').val(b.data('lvl'));$('#ee_sch').val(b.data('sch'));$('#ee_adr').val(b.data('adr'));$('#ee_yr').val(b.data('yr'))});
-$('.del-edu-btn').click(function(){var b=$(this);$('#de_id').val(b.data('id'));$('#de_sch').text(b.data('sch'));$('#deleteEducationModal').modal('show')});
+// ---------- Sidebar ----------
+const sb = document.getElementById('sidebar');
+const ov = document.getElementById('sidebarOverlay');
+document.getElementById('menuToggle').addEventListener('click', () => {
+    sb.classList.toggle('open');
+    ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
+});
+
+// ---------- Theme ----------
+const tb = document.getElementById('themeToggle');
+const ti = document.getElementById('themeIcon');
+const h  = document.documentElement;
+function st(t) {
+    h.setAttribute('data-bs-theme', t);
+    ti.className = 'bi bi-' + (t === 'dark' ? 'sun-fill' : 'moon-stars-fill');
+    document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + (60*60*24*365);
+}
+(function () {
+    const m = document.cookie.match(/admin_theme=([^;]+)/);
+    st(m ? m[1] : 'light');
+})();
+tb.addEventListener('click', () => st(h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'));
+
+// ---------- Document modals ----------
+$('.upload-doc-btn').click(function () {
+    $('#m_eid').val($(this).data('eid'));
+    $('#m_dname').text($(this).data('name'));
+    $('#m_msg').html('');
+    $('#m_file').val('');
+    $('#btnUpDoc').prop('disabled', false).html('Upload');
+    $('#uploadDocumentModal').modal('show');
+});
+
+$('.delete-doc-btn').click(function () {
+    $('#del_eid').val($(this).data('eid'));
+    $('#del_dname').text($(this).data('name'));
+    $('#deleteDocModal').modal('show');
+});
+
+$('#btnUpDoc').click(function () {
+    var f = new FormData($('#docForm')[0]);
+    $.ajax({
+        url: 'view_student.php',
+        type: 'POST',
+        data: f,
+        contentType: false,
+        processData: false,
+        beforeSend: function () {
+            $('#btnUpDoc').prop('disabled', true).html('<span class="spinner-border spinner-border-sm"></span>');
+        },
+        success: function () { location.reload(); },
+        error: function () {
+            $('#m_msg').html('<div class="flash error py-1 small mt-2" style="margin:0">Upload failed.</div>');
+            $('#btnUpDoc').prop('disabled', false).html('Upload');
+        }
+    });
+});
+
+// ---------- Grade modals ----------
+$('.edit-grd-btn').click(function () {
+    var b = $(this);
+    $('#eg_id').val(b.data('id'));
+    $('#eg_term').val(b.data('term'));
+    $('#eg_code').val(b.data('code'));
+    $('#eg_name').val(b.data('name'));
+    $('#eg_grd').val(b.data('grd'));
+    $('#eg_rem').val(b.data('rem'));
+});
+
+$('.del-grd-btn').click(function () {
+    var b = $(this);
+    $('#dg_id').val(b.data('id'));
+    $('#dg_name').text(b.data('name'));
+    $('#deleteGradeModal').modal('show');
+});
+
+// ---------- Education modals ----------
+$('.edit-edu-btn').click(function () {
+    var b = $(this);
+    $('#ee_id').val(b.data('id'));
+    $('#ee_lvl').val(b.data('lvl'));
+    $('#ee_sch').val(b.data('sch'));
+    $('#ee_adr').val(b.data('adr'));
+    $('#ee_yr').val(b.data('yr'));
+});
+
+$('.del-edu-btn').click(function () {
+    var b = $(this);
+    $('#de_id').val(b.data('id'));
+    $('#de_sch').text(b.data('sch'));
+    $('#deleteEducationModal').modal('show');
+});
 </script>
 </body>
 </html>

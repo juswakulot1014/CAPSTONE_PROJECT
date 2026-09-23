@@ -1,36 +1,14 @@
 <?php
-session_start();
-include "../config/db.php";
+require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/audit.php';
 
 $error = "";
 $success = "";
 
-// ============================================
-// SECURITY: Require authentication
-// ============================================
-if (!isset($_SESSION['admin_id'])) {
-    $_SESSION['redirect_after_login'] = 'change_user_password.php';
-    header("Location: admin_login.php");
-    exit();
-}
-
-// Require superadmin role
 if (($_SESSION['admin_role'] ?? '') !== 'superadmin') {
     $_SESSION['error'] = "Access Denied! Only the Principal can change passwords.";
     header("Location: dashboard.php");
     exit();
-}
-
-// Session integrity
-if (isset($_SESSION['user_agent']) && $_SESSION['user_agent'] !== ($_SERVER['HTTP_USER_AGENT'] ?? '')) {
-    session_destroy();
-    header("Location: admin_login.php?timeout=1");
-    exit();
-}
-
-// CSRF
-if (empty($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
 // Rate limiting
@@ -46,6 +24,8 @@ if (!isset($_SESSION[$rate_limit_key])) {
 // ============================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
+    verify_csrf();
+
     if ($_SESSION[$rate_limit_key]['count'] >= $max_attempts) {
         $since = time() - $_SESSION[$rate_limit_key]['last_attempt'];
         if ($since < $lockout_time) {
@@ -53,12 +33,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $error = "Too many attempts. Please try again in {$remaining} minute(s).";
         } else {
             $_SESSION[$rate_limit_key] = ['count' => 0, 'last_attempt' => 0];
-        }
-    }
-
-    if (empty($error)) {
-        if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'] ?? '')) {
-            $error = "Invalid security token. Please refresh the page and try again.";
         }
     }
 
@@ -78,7 +52,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $error = "Your admin password is incorrect. Action denied.";
                         $_SESSION[$rate_limit_key]['count']++;
                         $_SESSION[$rate_limit_key]['last_attempt'] = time();
-                        error_log("Password change verification failed for admin ID: {$_SESSION['admin_id']}");
+                        audit_log($conn, 'password.change_denied', [
+                            'type' => 'admin',
+                            'id'   => (int)$_SESSION['admin_id'],
+                        ]);
                     }
                 }
                 $verify_stmt->close();
@@ -143,15 +120,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
                                 $success = "Password successfully updated for user: " . htmlspecialchars($target_username);
 
-                                error_log(sprintf(
-                                    "[%s] Password changed for user '%s' (ID: %d) by admin '%s' (ID: %d) from IP: %s",
-                                    date('Y-m-d H:i:s'),
-                                    $target_username,
-                                    $user['id'],
-                                    $_SESSION['admin_name'] ?? 'unknown',
-                                    $_SESSION['admin_id'],
-                                    $_SERVER['REMOTE_ADDR'] ?? 'unknown'
-                                ));
+                                audit_log($conn, 'password.change', [
+                                    'type'     => 'admin',
+                                    'id'       => $user['id'],
+                                    'username' => $target_username,
+                                ]);
+
                                 unset($_POST['username'], $_POST['new_password'], $_POST['confirm_password']);
                             } else {
                                 $error = "Failed to update password. Please try again.";
@@ -199,393 +173,446 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
     <style>
+        /* ============================================================
+           Design tokens (matches dashboard.php / create_account.php)
+           ============================================================ */
         :root {
-            --bg: #f1f5f9; --surface: #ffffff; --surface2: #f8fafc;
-            --text: #1a1f36; --text2: #6b7280;
-            --border: #e5e7eb; --accent: #4f46e5; --accent2: #6366f1;
-            --green: #059669; --red: #dc2626; --amber: #d97706;
-            --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
-            --shadow: 0 1px 3px rgba(0,0,0,0.06);
-            --shadow-lg: 0 10px 25px rgba(0,0,0,0.08);
-            --radius: 12px; --radius-lg: 16px;
+            --bg: #f4f6fb;
+            --surface: #ffffff;
+            --surface-2: #f8fafc;
+            --text: #0f172a;
+            --text-2: #64748b;
+            --text-3: #94a3b8;
+            --border: #e5e7eb;
+            --border-strong: #d1d5db;
+            --accent: #4f46e5;
+            --accent-2: #6366f1;
+            --accent-soft: #eef2ff;
+            --green: #059669;
+            --green-soft: #d1fae5;
+            --red: #dc2626;
+            --red-soft: #fee2e2;
+            --amber: #d97706;
+            --amber-soft: #fef3c7;
+            --purple: #7c3aed;
+            --purple-soft: #ede9fe;
+
+            --shadow-xs: 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-sm: 0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-md: 0 4px 12px rgba(15,23,42,0.06);
+            --shadow-lg: 0 12px 32px rgba(15,23,42,0.10);
+
+            --radius-sm: 8px;
+            --radius: 12px;
+            --radius-lg: 16px;
+
+            --sidebar-w: 264px;
         }
+
         [data-bs-theme="dark"] {
-            --bg: #0f172a; --surface: #1e293b; --surface2: #1a2436;
-            --text: #f1f5f9; --text2: #94a3b8;
-            --border: #334155; --accent: #818cf8; --accent2: #6366f1;
-            --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
-            --shadow: 0 1px 3px rgba(0,0,0,0.3);
-            --shadow-lg: 0 10px 25px rgba(0,0,0,0.5);
+            --bg: #0b1220;
+            --surface: #131c2e;
+            --surface-2: #1a2439;
+            --text: #f1f5f9;
+            --text-2: #94a3b8;
+            --text-3: #64748b;
+            --border: #1f2a44;
+            --border-strong: #2d3b57;
+            --accent: #818cf8;
+            --accent-2: #6366f1;
+            --accent-soft: #1e2140;
+            --green-soft: #052e24;
+            --red-soft: #3f1517;
+            --amber-soft: #3d2a08;
+            --purple-soft: #2e1a54;
+
+            --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.35);
+            --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+            --shadow-lg: 0 12px 32px rgba(0,0,0,0.55);
         }
-        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
-        body{background:var(--bg);color:var(--text);min-height:100vh}
 
-        /* ===== Sidebar ===== */
-        .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
-        .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
-        .sidebar-brand img{width:40px;height:40px;border-radius:10px}
-        .sidebar-brand span{font-weight:700;font-size:1.1rem}
-        .sidebar-nav{flex:1;padding:1rem 0.75rem;overflow-y:auto}
-        .sidebar-nav a{display:flex;align-items:center;gap:0.75rem;padding:0.7rem 1rem;border-radius:10px;color:var(--text2);text-decoration:none;font-weight:500;font-size:0.9rem;transition:all 0.2s;margin-bottom:0.25rem}
-        .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
-        .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
-        .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
+        *{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;padding:0;box-sizing:border-box}
+        html,body{height:100%}
+        body{background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
 
-        /* ===== Main ===== */
-        .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
-        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
-        .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
-        .breadcrumb-nav{display:flex;align-items:center;gap:0.5rem;font-size:0.82rem;color:var(--text2);margin-bottom:0.25rem}
+        /* ============================================================
+           Sidebar
+           ============================================================ */
+        .sidebar{
+            position:fixed;left:0;top:0;bottom:0;width:var(--sidebar-w);
+            background:var(--surface);border-right:1px solid var(--border);
+            z-index:200;display:flex;flex-direction:column;
+            transition:transform .28s cubic-bezier(.4,0,.2,1);
+        }
+        .sidebar-brand{
+            padding:1.25rem 1.5rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;gap:.75rem;
+        }
+        .sidebar-brand img{
+            width:38px;height:38px;border-radius:10px;object-fit:cover;
+            box-shadow:0 0 0 3px var(--accent-soft);
+        }
+        .sidebar-brand .brand-text{display:flex;flex-direction:column;line-height:1.15}
+        .sidebar-brand .brand-name{font-weight:700;font-size:.95rem;color:var(--text)}
+        .sidebar-brand .brand-sub{font-size:.68rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+
+        .sidebar-nav{flex:1;padding:.75rem .75rem 1rem;overflow-y:auto}
+        .sidebar-nav .nav-label{
+            font-size:.65rem;font-weight:700;color:var(--text-3);
+            text-transform:uppercase;letter-spacing:.8px;
+            padding:.75rem .75rem .35rem;
+        }
+        .sidebar-nav a{
+            display:flex;align-items:center;gap:.75rem;
+            padding:.6rem .75rem;border-radius:10px;
+            color:var(--text-2);text-decoration:none;
+            font-weight:500;font-size:.875rem;
+            transition:background .15s, color .15s;
+            margin-bottom:.1rem;
+        }
+        .sidebar-nav a:hover{background:var(--surface-2);color:var(--text)}
+        .sidebar-nav a.active{background:var(--accent);color:#fff;box-shadow:0 4px 12px -4px rgba(79,70,229,.5)}
+        .sidebar-nav a.active:hover{background:var(--accent)}
+        .sidebar-nav a i{font-size:1.05rem;width:20px;text-align:center;flex-shrink:0}
+        .sidebar-footer{padding:.75rem;border-top:1px solid var(--border)}
+
+        /* ============================================================
+           Main content
+           ============================================================ */
+        .main-content{
+            margin-left:var(--sidebar-w);
+            padding:1.5rem clamp(1rem,2.5vw,2rem) 2rem;
+            min-height:100vh;
+            max-width:1600px;
+        }
+        .topbar{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:1.5rem;gap:1rem;flex-wrap:wrap;
+        }
+        .topbar h2{font-size:1.35rem;font-weight:700;letter-spacing:-.02em;margin:0}
+        .topbar .sub{font-size:.85rem;color:var(--text-2);margin:0}
+        .menu-toggle{
+            display:none;width:40px;height:40px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text);cursor:pointer;
+            align-items:center;justify-content:center;
+            transition:background .15s;
+        }
+        .menu-toggle:hover{background:var(--surface-2)}
+        .breadcrumb-nav{
+            display:flex;align-items:center;gap:.4rem;
+            font-size:.78rem;color:var(--text-2);
+            margin-bottom:.25rem;
+        }
         .breadcrumb-nav a{color:var(--accent);text-decoration:none;font-weight:500}
         .breadcrumb-nav a:hover{text-decoration:underline}
 
-        .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.15s}
-        .theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}
+        /* ============================================================
+           Theme button
+           ============================================================ */
+        .theme-btn{
+            width:38px;height:38px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text-2);cursor:pointer;
+            display:flex;align-items:center;justify-content:center;
+            transition:all .15s;
+        }
+        .theme-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 
-        /* ===== Centered form card ===== */
-        .cw-wrap {
-            max-width: 640px;
-            margin: 0 auto;
-            animation: cw-fade 0.25s ease;
-        }
-        @keyframes cw-fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+        .btn{font-weight:500;border-radius:9px;font-size:.82rem;transition:all .15s}
+        .btn-outline-secondary{color:var(--text-2);border-color:var(--border)}
+        .btn-outline-secondary:hover{background:var(--surface-2);color:var(--text);border-color:var(--border-strong)}
+        .btn-outline-danger{color:var(--red);border-color:color-mix(in srgb, var(--red) 35%, transparent)}
+        .btn-outline-danger:hover{background:var(--red);color:#fff;border-color:var(--red)}
 
-        .cw-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: var(--radius-lg);
-            box-shadow: var(--shadow);
-            overflow: hidden;
+        /* ============================================================
+           Form wrapper
+           ============================================================ */
+        .cw-wrap{
+            max-width:640px;margin:0 auto;
+            animation:cw-fade .25s ease;
         }
-        .cw-card-head {
-            display: flex;
-            align-items: center;
-            gap: 0.85rem;
-            padding: 1.15rem 1.5rem;
-            border-bottom: 1px solid var(--border);
-            background: linear-gradient(180deg, var(--surface), var(--surface2));
-        }
-        [data-bs-theme="dark"] .cw-card-head {
-            background: linear-gradient(180deg, var(--surface), var(--surface2));
-        }
-        .cw-card-head-icon {
-            width: 42px; height: 42px;
-            border-radius: 11px;
-            background: linear-gradient(135deg, var(--accent), var(--accent2));
-            color: white;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 1.1rem;
-            flex-shrink: 0;
-            box-shadow: 0 4px 12px rgba(79,70,229,0.35);
-        }
-        .cw-card-head h3 {
-            font-size: 1rem;
-            font-weight: 700;
-            margin: 0 0 0.1rem;
-            color: var(--text);
-        }
-        .cw-card-head p {
-            font-size: 0.82rem;
-            color: var(--text2);
-            margin: 0;
-        }
-        .cw-card-body { padding: 1.5rem; }
-
-        /* ===== Form ===== */
-        .cw-field { margin-bottom: 1.15rem; }
-        .cw-field-head {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 0.4rem;
-        }
-        .cw-field label {
-            display: block;
-            font-size: 0.75rem;
-            font-weight: 700;
-            color: var(--text2);
-            text-transform: uppercase;
-            letter-spacing: 0.55px;
-            margin-bottom: 0.4rem;
-        }
-        .cw-field-head label { margin-bottom: 0; }
-        .cw-charcount {
-            font-size: 0.72rem;
-            color: var(--text2);
-            font-variant-numeric: tabular-nums;
-            font-weight: 500;
+        @keyframes cw-fade{
+            from{opacity:0;transform:translateY(6px)}
+            to{opacity:1;transform:none}
         }
 
-        .cw-input-wrap { position: relative; }
-        .cw-input-wrap input {
-            width: 100%;
-            padding: 0.8rem 2.75rem 0.8rem 2.6rem;
-            border: 1.5px solid var(--border);
-            border-radius: 11px;
-            font-size: 0.92rem;
-            background: var(--bg);
-            color: var(--text);
-            font-family: inherit;
-            transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+        .cw-card{
+            background:var(--surface);border:1px solid var(--border);
+            border-radius:var(--radius-lg);box-shadow:var(--shadow-sm);
+            overflow:hidden;
         }
-        .cw-input-wrap input:focus {
-            outline: none;
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(79,70,229,0.15);
-            background: var(--surface);
+        .cw-card-head{
+            display:flex;align-items:center;gap:.85rem;
+            padding:1.15rem 1.5rem;
+            border-bottom:1px solid var(--border);
+            background:linear-gradient(180deg,var(--surface),var(--surface-2));
         }
-        .cw-input-wrap input::placeholder { color: var(--text2); opacity: 0.65; }
+        [data-bs-theme="dark"] .cw-card-head{
+            background:linear-gradient(180deg,var(--surface),var(--surface-2));
+        }
+        .cw-card-head-icon{
+            width:42px;height:42px;border-radius:11px;
+            background:linear-gradient(135deg,var(--accent),var(--accent-2));
+            color:#fff;display:flex;align-items:center;justify-content:center;
+            font-size:1.1rem;flex-shrink:0;
+            box-shadow:0 4px 12px rgba(79,70,229,.35);
+        }
+        .cw-card-head h3{font-size:1rem;font-weight:700;margin:0 0 .1rem;color:var(--text)}
+        .cw-card-head p{font-size:.82rem;color:var(--text-2);margin:0}
+        .cw-card-body{padding:1.5rem}
 
-        .cw-input-icon {
-            position: absolute;
-            left: 0.95rem;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--text2);
-            font-size: 1rem;
-            pointer-events: none;
-            transition: color 0.15s ease;
+        /* ============================================================
+           Fields
+           ============================================================ */
+        .cw-field{margin-bottom:1.15rem}
+        .cw-field-head{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:.4rem;
         }
-        .cw-input-wrap input:focus ~ .cw-input-icon {
-            color: var(--accent);
+        .cw-field label{
+            display:block;font-size:.75rem;font-weight:700;
+            color:var(--text-2);text-transform:uppercase;
+            letter-spacing:.55px;margin-bottom:.4rem;
         }
-        .cw-eye {
-            position: absolute;
-            right: 0.5rem;
-            top: 50%;
-            transform: translateY(-50%);
-            width: 32px;
-            height: 32px;
-            border: none;
-            background: transparent;
-            color: var(--text2);
-            cursor: pointer;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: background 0.15s ease, color 0.15s ease;
-        }
-        .cw-eye:hover { background: var(--bg); color: var(--accent); }
-        [data-bs-theme="dark"] .cw-eye:hover { background: var(--surface2); }
-
-        .cw-hint {
-            margin: 0.45rem 0 0;
-            font-size: 0.78rem;
-            color: var(--text2);
-            line-height: 1.4;
+        .cw-field-head label{margin-bottom:0}
+        .cw-charcount{
+            font-size:.72rem;color:var(--text-2);
+            font-variant-numeric:tabular-nums;font-weight:500;
         }
 
-        /* ===== Divider ===== */
-        .cw-divider {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            margin: 1.5rem 0 1.15rem;
+        .cw-input-wrap{position:relative}
+        .cw-input-wrap input{
+            width:100%;
+            padding:.8rem 2.75rem .8rem 2.6rem;
+            border:1.5px solid var(--border);
+            border-radius:11px;
+            font-size:.92rem;
+            background:var(--surface-2);
+            color:var(--text);
+            font-family:inherit;
+            transition:border-color .15s ease, box-shadow .15s ease, background .15s ease;
+        }
+        .cw-input-wrap input:focus{
+            outline:none;border-color:var(--accent);
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+            background:var(--surface);
+        }
+        .cw-input-wrap input::placeholder{color:var(--text-3);opacity:1}
+
+        .cw-input-icon{
+            position:absolute;left:.95rem;top:50%;
+            transform:translateY(-50%);
+            color:var(--text-3);font-size:1rem;
+            pointer-events:none;
+            transition:color .15s ease;
+        }
+        .cw-input-wrap input:focus ~ .cw-input-icon{color:var(--accent)}
+
+        .cw-eye{
+            position:absolute;right:.5rem;top:50%;
+            transform:translateY(-50%);
+            width:32px;height:32px;border:none;
+            background:transparent;color:var(--text-2);
+            cursor:pointer;border-radius:8px;
+            display:flex;align-items:center;justify-content:center;
+            transition:background .15s ease, color .15s ease;
+        }
+        .cw-eye:hover{background:var(--surface-2);color:var(--accent)}
+
+        .cw-hint{
+            margin:.45rem 0 0;
+            font-size:.78rem;color:var(--text-2);line-height:1.4;
+        }
+
+        /* ============================================================
+           Divider
+           ============================================================ */
+        .cw-divider{
+            display:flex;align-items:center;gap:.75rem;
+            margin:1.5rem 0 1.15rem;
         }
         .cw-divider::before,
-        .cw-divider::after {
-            content: '';
-            flex: 1;
-            height: 1px;
-            background: var(--border);
+        .cw-divider::after{
+            content:'';flex:1;height:1px;background:var(--border);
         }
-        .cw-divider span {
-            font-size: 0.7rem;
-            font-weight: 700;
-            color: var(--text2);
-            text-transform: uppercase;
-            letter-spacing: 0.6px;
-            white-space: nowrap;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.35rem;
+        .cw-divider span{
+            font-size:.7rem;font-weight:700;color:var(--text-2);
+            text-transform:uppercase;letter-spacing:.6px;
+            white-space:nowrap;
+            display:inline-flex;align-items:center;gap:.35rem;
         }
-        .cw-divider span i { font-size: 0.75rem; color: var(--accent); }
+        .cw-divider span i{font-size:.75rem;color:var(--accent)}
 
-        /* ===== Strength meter — segmented ===== */
-        .cw-strength {
-            display: grid;
-            grid-template-columns: repeat(5, 1fr);
-            gap: 4px;
-            margin-top: 0.55rem;
+        /* ============================================================
+           Strength meter
+           ============================================================ */
+        .cw-strength{
+            display:grid;grid-template-columns:repeat(5,1fr);
+            gap:4px;margin-top:.55rem;
         }
-        .cw-strength-seg {
-            height: 5px;
-            border-radius: 3px;
-            background: var(--border);
-            transition: background 0.2s ease;
+        .cw-strength-seg{
+            height:5px;border-radius:3px;
+            background:var(--border);
+            transition:background .2s ease;
         }
-        .cw-strength-seg.active-weak   { background: var(--red); }
-        .cw-strength-seg.active-medium { background: var(--amber); }
-        .cw-strength-seg.active-strong { background: var(--green); }
+        .cw-strength-seg.active-weak  {background:var(--red)}
+        .cw-strength-seg.active-medium{background:var(--amber)}
+        .cw-strength-seg.active-strong{background:var(--green)}
 
-        .cw-reqs {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 0.35rem;
-            margin-top: 0.6rem;
+        /* ============================================================
+           Requirement pills
+           ============================================================ */
+        .cw-reqs{
+            display:flex;flex-wrap:wrap;gap:.35rem;
+            margin-top:.6rem;
         }
-        .cw-req {
-            display: inline-flex;
-            align-items: center;
-            gap: 0.35rem;
-            padding: 0.22rem 0.6rem;
-            border-radius: 20px;
-            font-size: 0.7rem;
-            font-weight: 600;
-            background: var(--bg);
-            color: var(--text2);
-            border: 1px solid var(--border);
-            transition: all 0.15s ease;
+        .cw-req{
+            display:inline-flex;align-items:center;gap:.35rem;
+            padding:.22rem .6rem;border-radius:20px;
+            font-size:.7rem;font-weight:600;
+            background:var(--surface-2);color:var(--text-2);
+            border:1px solid var(--border);
+            transition:all .15s ease;
         }
-        .cw-req i {
-            font-size: 0.6rem;
-            color: var(--text2);
-            opacity: 0.55;
-            transition: all 0.15s ease;
+        .cw-req i{font-size:.6rem;color:var(--text-3);opacity:.7;transition:all .15s ease}
+        .cw-req.met{
+            background:var(--green-soft);color:var(--green);
+            border-color:color-mix(in srgb, var(--green) 30%, transparent);
         }
-        .cw-req.met {
-            background: #ecfdf5;
-            color: #065f46;
-            border-color: #6ee7b7;
+        .cw-req.met i{color:var(--green);opacity:1}
+
+        /* ============================================================
+           Submit button
+           ============================================================ */
+        .cw-submit{
+            width:100%;
+            padding:.9rem 1.25rem;
+            border:none;border-radius:11px;
+            background:linear-gradient(135deg,var(--accent),var(--accent-2));
+            color:#fff;
+            font-size:.95rem;font-weight:600;font-family:inherit;
+            cursor:pointer;
+            display:inline-flex;align-items:center;justify-content:center;
+            gap:.5rem;
+            box-shadow:0 4px 14px rgba(79,70,229,.3);
+            transition:transform .15s ease, box-shadow .15s ease, opacity .15s ease;
+            margin-top:.75rem;letter-spacing:.2px;
         }
-        .cw-req.met i {
-            color: #10b981;
-            opacity: 1;
+        .cw-submit:hover:not(:disabled){
+            transform:translateY(-1px);
+            box-shadow:0 6px 18px rgba(79,70,229,.4);
         }
-        [data-bs-theme="dark"] .cw-req.met {
-            background: #064e3b;
-            color: #6ee7b7;
-            border-color: #065f46;
+        .cw-submit:active:not(:disabled){transform:translateY(0)}
+        .cw-submit:disabled{opacity:.65;cursor:not-allowed}
+
+        /* ============================================================
+           Alerts
+           ============================================================ */
+        .cw-alert{
+            display:flex;align-items:flex-start;gap:.65rem;
+            padding:.85rem 1.1rem;
+            border-radius:12px;
+            font-size:.86rem;line-height:1.5;
+            margin-bottom:1.15rem;
+            border-left:4px solid;
+            animation:cw-fade .2s ease;
         }
-        [data-bs-theme="dark"] .cw-req.met i {
-            color: #34d399;
+        .cw-alert i{margin-top:2px;flex-shrink:0;font-size:1.05rem}
+        .cw-alert-error{
+            background:var(--red-soft);color:var(--red);
+            border-color:var(--red);
+        }
+        .cw-alert-success{
+            background:var(--green-soft);color:var(--green);
+            border-color:var(--green);
         }
 
-        /* ===== Submit ===== */
-        .cw-submit {
-            width: 100%;
-            padding: 0.9rem 1.25rem;
-            border: none;
-            border-radius: 11px;
-            background: linear-gradient(135deg, var(--accent), var(--accent2));
-            color: white;
-            font-size: 0.95rem;
-            font-weight: 600;
-            font-family: inherit;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 0.5rem;
-            box-shadow: 0 4px 14px rgba(79,70,229,0.3);
-            transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
-            margin-top: 0.75rem;
-            letter-spacing: 0.2px;
+        .cw-attempts{
+            display:flex;align-items:center;gap:.55rem;
+            padding:.65rem .9rem;border-radius:10px;
+            background:var(--amber-soft);color:var(--amber);
+            font-size:.82rem;font-weight:600;
+            margin-bottom:1.15rem;
+            border-left:4px solid var(--amber);
         }
-        .cw-submit:hover:not(:disabled) {
-            transform: translateY(-1px);
-            box-shadow: 0 6px 18px rgba(79,70,229,0.4);
-        }
-        .cw-submit:active:not(:disabled) {
-            transform: translateY(0);
-        }
-        .cw-submit:disabled { opacity: 0.65; cursor: not-allowed; }
+        .cw-attempts i{font-size:1rem}
 
-        /* ===== Alerts ===== */
-        .cw-alert {
-            display: flex;
-            align-items: flex-start;
-            gap: 0.65rem;
-            padding: 0.85rem 1.1rem;
-            border-radius: 12px;
-            font-size: 0.86rem;
-            line-height: 1.5;
-            margin-bottom: 1.15rem;
-            border-left: 4px solid;
-            animation: cw-fade 0.2s ease;
-        }
-        .cw-alert i { margin-top: 2px; flex-shrink: 0; font-size: 1.05rem; }
-        .cw-alert-error { background: #fef2f2; color: #991b1b; border-color: var(--red); }
-        [data-bs-theme="dark"] .cw-alert-error { background: #450a0a; color: #fecaca; }
-        .cw-alert-success { background: #ecfdf5; color: #065f46; border-color: var(--green); }
-        [data-bs-theme="dark"] .cw-alert-success { background: #064e3b; color: #6ee7b7; }
-
-        /* ===== Attempts notice ===== */
-        .cw-attempts {
-            display: flex;
-            align-items: center;
-            gap: 0.55rem;
-            padding: 0.65rem 0.9rem;
-            border-radius: 10px;
-            background: #fef3c7;
-            color: #92400e;
-            font-size: 0.82rem;
-            font-weight: 600;
-            margin-bottom: 1.15rem;
-            border-left: 4px solid var(--amber);
-        }
-        [data-bs-theme="dark"] .cw-attempts {
-            background: #78350f;
-            color: #fcd34d;
-        }
-        .cw-attempts i { font-size: 1rem; }
-
-        @media(max-width:1024px){
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width:1024px){
             .sidebar{transform:translateX(-100%)}
             .sidebar.open{transform:translateX(0)}
             .main-content{margin-left:0}
             .menu-toggle{display:flex}
         }
-        @media(max-width:640px){
+        @media (max-width:640px){
             .main-content{padding:1rem}
-            .cw-card-body { padding: 1.15rem; }
-            .cw-card-head { padding: 1rem 1.15rem; }
+            .cw-card-body{padding:1.15rem}
+            .cw-card-head{padding:1rem 1.15rem}
         }
     </style>
 </head>
 <body>
 
-<!-- ===== Sidebar ===== -->
+<!-- ================= Sidebar ================= -->
 <aside class="sidebar" id="sidebar">
-    <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
+    <div class="sidebar-brand">
+        <img src="../assets/img/usat.jpg" alt="USAT" onerror="this.style.background='var(--accent)'">
+        <div class="brand-text">
+            <span class="brand-name">USAT Admin</span>
+            <span class="brand-sub">Enrollment System</span>
+        </div>
+    </div>
     <nav class="sidebar-nav">
+        <div class="nav-label">Overview</div>
         <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
         <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
+        <div class="nav-label" style="margin-top:.5rem">Administration</div>
         <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
         <a href="change_user_password.php" class="active"><i class="bi bi-key"></i> Change Password</a>
+        <?php if (($_SESSION['admin_role'] ?? '') === 'superadmin'): ?>
+            <a href="audit_log.php"><i class="bi bi-shield-check"></i> Audit Log</a>
+        <?php endif; ?>
     </nav>
-    <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
+    <div class="sidebar-footer">
+        <a href="logout.php" class="btn btn-outline-danger btn-sm w-100">
+            <i class="bi bi-box-arrow-right me-1"></i> Logout
+        </a>
+    </div>
 </aside>
 
-<!-- ===== Main ===== -->
 <div class="main-content" id="mainContent">
 
-    <!-- Topbar -->
+    <!-- ================= Topbar ================= -->
     <div class="topbar">
         <div class="d-flex align-items-center gap-3">
             <button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button>
             <div>
                 <div class="breadcrumb-nav">
                     <a href="create_account.php">Accounts</a>
-                    <i class="bi bi-chevron-right small"></i>
-                    Change Password
+                    <i class="bi bi-chevron-right" style="font-size:.7rem;opacity:.6"></i>
+                    <span>Change Password</span>
                 </div>
-                <h2 style="font-size:1.4rem;font-weight:700;margin:0">Change User Password</h2>
-                <p class="text-muted small mb-0">Reset another admin's password</p>
+                <h2>Change User Password</h2>
+                <p class="sub">Reset another admin's password</p>
             </div>
         </div>
         <div class="d-flex gap-2 align-items-center">
-            <a href="create_account.php" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i> Back</a>
-            <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+            <a href="create_account.php" class="btn btn-outline-secondary btn-sm">
+                <i class="bi bi-arrow-left me-1"></i> Back
+            </a>
+            <button class="theme-btn" id="themeToggle" title="Toggle theme">
+                <i class="bi bi-moon-stars-fill" id="themeIcon"></i>
+            </button>
         </div>
     </div>
 
     <div class="cw-wrap">
 
-        <!-- Alerts -->
         <?php if ($error): ?>
             <div class="cw-alert cw-alert-error" role="alert">
                 <i class="bi bi-exclamation-circle-fill"></i>
@@ -606,7 +633,6 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
             </div>
         <?php endif; ?>
 
-        <!-- Form card -->
         <div class="cw-card">
             <div class="cw-card-head">
                 <div class="cw-card-head-icon"><i class="bi bi-key-fill"></i></div>
@@ -720,31 +746,35 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     </div>
 </div>
 
-<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
+<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(2px);z-index:199"
+     onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-// ===== Sidebar toggle =====
-const sb = document.getElementById('sidebar'), ov = document.getElementById('sidebarOverlay');
+// ---------- Sidebar ----------
+const sb = document.getElementById('sidebar');
+const ov = document.getElementById('sidebarOverlay');
 document.getElementById('menuToggle').addEventListener('click', () => {
     sb.classList.toggle('open');
     ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
 });
 
-// ===== Theme toggle =====
-const tb = document.getElementById('themeToggle'), ti = document.getElementById('themeIcon'), h = document.documentElement;
-function st(t){
+// ---------- Theme ----------
+const tb = document.getElementById('themeToggle');
+const ti = document.getElementById('themeIcon');
+const h  = document.documentElement;
+function st(t) {
     h.setAttribute('data-bs-theme', t);
     ti.className = 'bi bi-' + (t === 'dark' ? 'sun-fill' : 'moon-stars-fill');
-    document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + 60*60*24*365;
+    document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + (60*60*24*365);
 }
-(function(){
+(function () {
     const m = document.cookie.match(/(?:^|; )admin_theme=([^;]+)/);
     st(m ? decodeURIComponent(m[1]) : 'light');
 })();
 tb.addEventListener('click', () => st(h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'));
 
-// ===== Password visibility toggles =====
+// ---------- Password visibility ----------
 document.querySelectorAll('[data-toggle-pw]').forEach(btn => {
     btn.addEventListener('click', () => {
         const input = document.getElementById(btn.getAttribute('data-toggle-pw'));
@@ -760,8 +790,8 @@ document.querySelectorAll('[data-toggle-pw]').forEach(btn => {
     });
 });
 
-// ===== Strength meter + requirement pills + char counter =====
-(function() {
+// ---------- Strength meter ----------
+(function () {
     const input = document.getElementById('new_password');
     const segs  = document.querySelectorAll('#cwStrength .cw-strength-seg');
     const reqs  = document.getElementById('cwReqs');
@@ -799,20 +829,20 @@ document.querySelectorAll('[data-toggle-pw]').forEach(btn => {
         if (count) {
             const n = p.length;
             count.textContent = n + ' / 128';
-            count.style.color = n > 128 ? 'var(--red)' : (n >= 8 ? 'var(--green)' : 'var(--text2)');
+            count.style.color = n > 128 ? 'var(--red)' : (n >= 8 ? 'var(--green)' : 'var(--text-2)');
         }
     });
 })();
 
-// ===== Form submit =====
-(function() {
+// ---------- Submit loading state ----------
+(function () {
     const form = document.getElementById('passwordForm');
     const btn  = document.getElementById('cwSubmit');
     if (!form || !btn) return;
     const btnText = btn.querySelector('span');
     const btnIcon = btn.querySelector('i');
 
-    form.addEventListener('submit', function(e) {
+    form.addEventListener('submit', function (e) {
         const np = document.getElementById('new_password').value;
         const cp = document.getElementById('confirm_password').value;
         const ap = document.getElementById('admin_password').value;

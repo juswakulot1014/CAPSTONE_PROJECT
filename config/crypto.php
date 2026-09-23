@@ -1,13 +1,24 @@
 <?php
 // config/crypto.php — symmetric encryption for document blobs
 // Requires: ext-sodium, DOC_ENC_KEY (64 hex chars) defined in config/paths.php
+//
+// This is a leaf file. It requires NOTHING.
+// DO NOT add require/include here — creates circular dependency with paths.php.
 
 if (!defined('DOC_ENC_KEY')) {
-    throw new RuntimeException('DOC_ENC_KEY is not defined. Include config/paths.php first.');
+    throw new RuntimeException(
+        'DOC_ENC_KEY is not defined. Include config/paths.php first.'
+    );
 }
 
 /**
  * Encrypt plaintext. Returns nonce || ciphertext (binary).
+ *
+ * Output layout:
+ *   [ 24 bytes nonce ][ N bytes ciphertext + 16-byte MAC ]
+ *
+ * The nonce is randomly generated per call, so encrypting the same
+ * plaintext twice produces different ciphertexts.
  */
 function doc_encrypt(string $plain): string
 {
@@ -18,6 +29,11 @@ function doc_encrypt(string $plain): string
 
 /**
  * Decrypt a nonce||ciphertext blob. Returns plaintext, or false on failure.
+ *
+ * Returns false if:
+ *   - blob is too short to contain a nonce
+ *   - MAC verification fails (tampered or wrong key)
+ *   - sodium extension returns failure
  */
 function doc_decrypt(string $blob): string|false
 {
@@ -32,6 +48,10 @@ function doc_decrypt(string $blob): string|false
 
 /**
  * Read an encrypted file from disk and return plaintext, or false on failure.
+ *
+ * Caller must ensure $abs_path is trusted (e.g., resolved with realpath()
+ * and confirmed to live inside DOCUMENTS_DIR). This function does no
+ * path-traversal checking of its own.
  */
 function doc_read_decrypt(string $abs_path): string|false
 {

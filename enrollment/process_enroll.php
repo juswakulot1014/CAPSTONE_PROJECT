@@ -1,15 +1,8 @@
 <?php
-// Start session only if not already active
-if (session_status() === PHP_SESSION_NONE) {
-    session_start();
-}
+require_once __DIR__ . '/../config/bootstrap.php';
+require_once __DIR__ . '/../config/crypto.php';
 
-// Include database and config only once
-include_once __DIR__ . "/../config/db.php";
-require_once __DIR__ . "/../config/paths.php";
-require_once __DIR__ . "/../config/crypto.php";
-
-// Check if request method is POST
+// Check request method
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     $_SESSION['error'] = 'Invalid request method.';
     header('Location: enroll_form.php');
@@ -25,7 +18,6 @@ if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'] ?? '', 
 
 /**
  * Auto-detect types and bind params safely.
- * Prevents "number of elements in type definition string" errors.
  */
 function bind_params(mysqli_stmt $stmt, array $values): void
 {
@@ -34,7 +26,7 @@ function bind_params(mysqli_stmt $stmt, array $values): void
         $types .= match (true) {
             is_int($v)   => 'i',
             is_float($v) => 'd',
-            default      => 's', // strings and nulls
+            default      => 's',
         };
     }
     $stmt->bind_param($types, ...$values);
@@ -42,21 +34,6 @@ function bind_params(mysqli_stmt $stmt, array $values): void
 
 /**
  * Assign a provisional section for a new enrollee.
- *
- * Sections are grouped by STRAND, e.g.:
- *   "ICT Support and Computer Programming Technologies A"
- *   "ICT Support and Computer Programming Technologies B"
- *
- * Algorithm:
- *   1. Look at existing sections for the same strand / grade / SY.
- *   2. Fill the FULLEST section that still has room (< $target_size).
- *      That way each section reaches $target_size before the next opens.
- *   3. If all full, open the next letter A → B → C → ... → Z.
- *   4. If none exist yet, start with "A".
- *
- * Concurrency note: the caller holds a global advisory lock, so two
- * simultaneous enrollments cannot both land in the same section.
- * The admin "Auto Section" button rebalances if needed.
  */
 function assignProvisionalSection(
     mysqli $conn,
@@ -66,9 +43,7 @@ function assignProvisionalSection(
     int $target_size = 35
 ): string {
     $strand = trim($strand);
-    if ($strand === '') {
-        $strand = 'General';
-    }
+    if ($strand === '') $strand = 'General';
 
     $stmt = $conn->prepare("
         SELECT section, COUNT(*) AS n
@@ -81,29 +56,19 @@ function assignProvisionalSection(
         GROUP BY section
         ORDER BY n DESC, section ASC
     ");
-    if (!$stmt) {
-        // Fallback if prepare fails — use the first-letter name
-        return $strand . ' A';
-    }
+    if (!$stmt) return $strand . ' A';
 
     $stmt->bind_param("sss", $strand, $grade_level, $school_year);
     $stmt->execute();
     $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
 
-    // Case 1: no sections yet for this strand → start at A
-    if (empty($rows)) {
-        return $strand . ' A';
-    }
+    if (empty($rows)) return $strand . ' A';
 
-    // Case 2: fill the fullest section that still has room
     foreach ($rows as $r) {
-        if ((int)$r['n'] < $target_size) {
-            return $r['section'];
-        }
+        if ((int)$r['n'] < $target_size) return $r['section'];
     }
 
-    // Case 3: every existing section is full → open the next letter
     $used_letters = [];
     foreach ($rows as $r) {
         if (preg_match('/\s+([A-Z])\s*$/i', $r['section'], $m)) {
@@ -112,43 +77,27 @@ function assignProvisionalSection(
     }
 
     for ($i = 0; $i < 26; $i++) {
-        $letter = chr(65 + $i); // A..Z
-        if (!isset($used_letters[$letter])) {
-            return $strand . ' ' . $letter;
-        }
+        $letter = chr(65 + $i);
+        if (!isset($used_letters[$letter])) return $strand . ' ' . $letter;
     }
 
-    // All 26 letters in use — extremely unlikely at SHS scale.
     return $strand . ' Z';
 }
 
 /**
  * Encrypt and store a staged file.
- *
- * Reads the staged plaintext, verifies MIME, encrypts with libsodium,
- * writes the nonce||ciphertext blob into DOCUMENTS_DIR, deletes the
- * staged file on success, and returns file metadata for the DB row.
- *
- * Throws on any failure — caller's transaction rolls back.
  */
 function store_encrypted_file(
     string $staging_path,
     int $student_id,
     int $max_bytes = 5 * 1024 * 1024
 ): array {
-    if (!is_file($staging_path)) {
-        throw new Exception("Staged file missing");
-    }
-    if (filesize($staging_path) > $max_bytes) {
-        throw new Exception("File too large");
-    }
+    if (!is_file($staging_path)) throw new Exception("Staged file missing");
+    if (filesize($staging_path) > $max_bytes) throw new Exception("File too large");
 
     $plain = file_get_contents($staging_path);
-    if ($plain === false || $plain === '') {
-        throw new Exception("Empty file");
-    }
+    if ($plain === false || $plain === '') throw new Exception("Empty file");
 
-    // Re-verify MIME from the actual bytes (defense in depth).
     $fi = finfo_open(FILEINFO_MIME_TYPE);
     $mime = finfo_file($fi, $staging_path);
     finfo_close($fi);
@@ -158,9 +107,7 @@ function store_encrypted_file(
         'image/jpeg'      => 'jpg',
         'image/png'       => 'png',
     ];
-    if (!isset($allowed[$mime])) {
-        throw new Exception("Invalid file type: {$mime}");
-    }
+    if (!isset($allowed[$mime])) throw new Exception("Invalid file type: {$mime}");
 
     $blob = doc_encrypt($plain);
 
@@ -186,10 +133,10 @@ function store_encrypted_file(
     ];
 }
 
-// Track files written to disk in case we need to clean up on rollback
+// Track files written to disk for cleanup on rollback
 $written_files = [];
 
-// ── Server-side age recompute (never trust the client-posted value) ──
+// ── Server-side age recompute ──
 if (empty($_POST['birth_date'])) {
     $_SESSION['error'] = 'Birth date is required.';
     header('Location: enroll_form.php');
@@ -209,7 +156,7 @@ if ($real_age < 14 || $real_age > 25) {
 }
 $_POST['age'] = $real_age;
 
-// ── Serialize concurrent enrollments (section + student ID sequence) ──
+// ── Serialize concurrent enrollments ──
 $got_lock = false;
 $lock_res = $conn->query("SELECT GET_LOCK('enroll_global', 10) AS ok");
 if ($lock_res) {
@@ -223,7 +170,6 @@ if (!$got_lock) {
     exit();
 }
 
-// Begin transaction
 $conn->begin_transaction();
 
 try {
@@ -235,9 +181,7 @@ try {
          civil_status, nationality, religion, height, weight, email, phone, special_skills, photo) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
-    if (!$stmt) {
-        throw new Exception("Prepare failed for students_info: " . $conn->error);
-    }
+    if (!$stmt) throw new Exception("Prepare failed for students_info: " . $conn->error);
 
     $lrn = $_POST['lrn'] ?? '';
     $first_name = $_POST['first_name'] ?? '';
@@ -259,75 +203,52 @@ try {
     $photo = null;
 
     bind_params($stmt, [
-        $lrn,
-        $first_name,
-        $last_name,
-        $middle_name,
-        $nick_name,
-        $ext_name,
-        $sex,
-        $birth_date,
-        $age,
-        $civil_status,
-        $nationality,
-        $religion,
-        $height,
-        $weight,
-        $email,
-        $phone,
-        $special_skills,
-        $photo,
+        $lrn, $first_name, $last_name, $middle_name, $nick_name, $ext_name,
+        $sex, $birth_date, $age, $civil_status, $nationality, $religion,
+        $height, $weight, $email, $phone, $special_skills, $photo,
     ]);
 
-    if (!$stmt->execute()) {
-        throw new Exception("Execute failed for students_info: " . $stmt->error);
-    }
+    if (!$stmt->execute()) throw new Exception("Execute failed for students_info: " . $stmt->error);
 
     $student_info_id = $conn->insert_id;
     $stmt->close();
 
     // ============================================
     // 2. GENERATE STUDENT ID NUMBER
+    //    Format: UCSCI-{year enrolled}-{6 random digits}
+    //    Example: UCSCI-2026-483920
     // ============================================
     $school_year = $_POST['school_year'] ?? '';
+    $sy_parts = explode('-', $school_year);
+    $year_enrolled = (int)($sy_parts[0] ?? 0);
 
-    $school_year_parts = explode('-', $school_year);
-    $school_year_short = end($school_year_parts);
-
-    $birth_date_formatted = date('Ymd', strtotime($birth_date));
-
-    $base_id = 'USAT-SY' . $school_year_short . $birth_date_formatted;
-
-    $seq_stmt = $conn->prepare("
-        SELECT COALESCE(MAX(CAST(SUBSTRING(student_id_number, ?) AS UNSIGNED)), 0) + 1 
-        FROM students_info 
-        WHERE student_id_number LIKE CONCAT(?, '-%')
-        FOR UPDATE
-    ");
-
-    if (!$seq_stmt) {
-        throw new Exception("Prepare failed for sequence lookup: " . $conn->error);
+    if ($year_enrolled < 2000 || $year_enrolled > 2100) {
+        $year_enrolled = (int)date('Y');
     }
 
-    $seq_start_position = strlen($base_id) + 2;
+    $student_id_number = '';
+    $attempts = 0;
+    $collision = true;
 
-    bind_params($seq_stmt, [$seq_start_position, $base_id]);
-    $seq_stmt->execute();
-    $seq_stmt->bind_result($next_sequence);
-    $seq_stmt->fetch();
-    $seq_stmt->close();
+    do {
+        $random6 = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        $student_id_number = "UCSCI-{$year_enrolled}-{$random6}";
 
-    $student_id_number = $base_id . '-' . str_pad((string)$next_sequence, 4, '0', STR_PAD_LEFT);
+        $check = $conn->prepare("SELECT 1 FROM students_info WHERE student_id_number = ? LIMIT 1");
+        $check->bind_param("s", $student_id_number);
+        $check->execute();
+        $collision = $check->get_result()->num_rows > 0;
+        $check->close();
 
-    $update_stmt = $conn->prepare("
-        UPDATE students_info 
-        SET student_id_number = ? 
-        WHERE student_id = ?
-    ");
+        $attempts++;
+    } while ($collision && $attempts < 10);
 
-    if (!$update_stmt) {
-        throw new Exception("Prepare failed for student_id_number update: " . $conn->error);
+    if ($collision) {
+        throw new Exception("Could not generate a unique Student ID after 10 attempts.");
     }
+
+    $update_stmt = $conn->prepare("UPDATE students_info SET student_id_number = ? WHERE student_id = ?");
+    if (!$update_stmt) throw new Exception("Prepare failed for student_id_number update: " . $conn->error);
 
     bind_params($update_stmt, [$student_id_number, $student_info_id]);
 
@@ -343,9 +264,7 @@ try {
         (student_id, purok_street, barangay, town_city, province, region, district, postal_code) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
-    if (!$stmt) {
-        throw new Exception("Prepare failed for addresses: " . $conn->error);
-    }
+    if (!$stmt) throw new Exception("Prepare failed for addresses: " . $conn->error);
 
     $purok_street = $_POST['purok_street'] ?? null;
     $barangay = $_POST['barangay'] ?? null;
@@ -356,27 +275,15 @@ try {
     $postal_code = $_POST['postal_code'] ?? null;
 
     bind_params($stmt, [
-        $student_info_id,
-        $purok_street,
-        $barangay,
-        $town_city,
-        $province,
-        $region,
-        $district,
-        $postal_code,
+        $student_info_id, $purok_street, $barangay, $town_city,
+        $province, $region, $district, $postal_code,
     ]);
 
-    if (!$stmt->execute()) {
-        throw new Exception("Execute failed for addresses: " . $stmt->error);
-    }
+    if (!$stmt->execute()) throw new Exception("Execute failed for addresses: " . $stmt->error);
     $stmt->close();
 
     // ============================================
     // 4. INSERT INTO parents_info
-    //
-    // FIX: mother_name is no longer populated from mother_maiden_name.
-    // The form does not collect a separate mother full-name field, so we
-    // insert NULL instead of duplicating the maiden name into both columns.
     // ============================================
     $stmt = $conn->prepare("INSERT INTO parents_info 
         (student_id, father_name, father_occupation, father_contact, mother_name,
@@ -384,9 +291,7 @@ try {
          is_4ps, guardian_fullname, guardian_relation, guardian_contact, household_id) 
         VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
-    if (!$stmt) {
-        throw new Exception("Prepare failed for parents_info: " . $conn->error);
-    }
+    if (!$stmt) throw new Exception("Prepare failed for parents_info: " . $conn->error);
 
     $father_name = $_POST['father_name'] ?? null;
     $father_occupation = $_POST['father_occupation'] ?? null;
@@ -402,24 +307,13 @@ try {
     $parent_household_id = $_POST['household_id'] ?? null;
 
     bind_params($stmt, [
-        $student_info_id,
-        $father_name,
-        $father_occupation,
-        $father_contact,
-        $mother_maiden_name,
-        $mother_occupation,
-        $mother_contact,
-        $ave_family_income,
-        $is_4ps,
-        $guardian_fullname,
-        $guardian_relation,
-        $guardian_contact,
-        $parent_household_id,
+        $student_info_id, $father_name, $father_occupation, $father_contact,
+        $mother_maiden_name, $mother_occupation, $mother_contact,
+        $ave_family_income, $is_4ps, $guardian_fullname, $guardian_relation,
+        $guardian_contact, $parent_household_id,
     ]);
 
-    if (!$stmt->execute()) {
-        throw new Exception("Execute failed for parents_info: " . $stmt->error);
-    }
+    if (!$stmt->execute()) throw new Exception("Execute failed for parents_info: " . $stmt->error);
     $stmt->close();
 
     // ============================================
@@ -430,79 +324,51 @@ try {
             (student_id, level, school_name, school_address, year_completed) 
             VALUES (?, ?, ?, ?, ?)");
 
-        if (!$stmt) {
-            throw new Exception("Prepare failed for educational_history: " . $conn->error);
-        }
+        if (!$stmt) throw new Exception("Prepare failed for educational_history: " . $conn->error);
 
         foreach ($_POST['edu_level'] as $i => $level) {
-            if (empty($level)) {
-                continue;
-            }
+            if (empty($level)) continue;
 
             $school_name = $_POST['school_name'][$i] ?? null;
             $school_address = $_POST['school_address'][$i] ?? null;
             $year_completed = $_POST['year_completed'][$i] ?? null;
 
             bind_params($stmt, [
-                $student_info_id,
-                $level,
-                $school_name,
-                $school_address,
-                $year_completed,
+                $student_info_id, $level, $school_name, $school_address, $year_completed,
             ]);
 
-            if (!$stmt->execute()) {
-                throw new Exception("Execute failed for educational_history entry $i: " . $stmt->error);
-            }
+            if (!$stmt->execute()) throw new Exception("Execute failed for educational_history entry $i: " . $stmt->error);
         }
         $stmt->close();
     }
 
     // ============================================
     // 6. INSERT INTO enrollment_form
-    //
-    // Section is assigned automatically based on the strand.
-    // If a section was posted (future admin-side form), respect it.
+    //    Uses `term` column (not `semester`)
     // ============================================
     $stmt = $conn->prepare("INSERT INTO enrollment_form 
-        (student_id, school_year, grade_level, semester, track, strand, program, section,
+        (student_id, school_year, grade_level, term, track, strand, program, section,
          household_id, is_transferred, previous_school_name, previous_school_address, 
          previous_track, previous_strand, previous_program, previous_year_completed, 
          voucher_status, cct_4ps, status) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')");
 
-    if (!$stmt) {
-        throw new Exception("Prepare failed for enrollment_form: " . $conn->error);
-    }
+    if (!$stmt) throw new Exception("Prepare failed for enrollment_form: " . $conn->error);
 
     $grade_level = $_POST['grade_level'] ?? '';
-    $semester = $_POST['semester'] ?? '';
+    $term = $_POST['term'] ?? '';
     $track = $_POST['track'] ?? 'TECHPRO ELECTIVES';
     $strand = trim((string)($_POST['strand'] ?? ''));
-    if ($strand === '') {
-        // Fallback if strand is somehow empty (should not happen given validation)
-        $strand = trim((string)($_POST['program'] ?? ''));
-    }
-    if ($strand === '') {
-        $strand = 'General';
-    }
+    if ($strand === '') $strand = trim((string)($_POST['program'] ?? ''));
+    if ($strand === '') $strand = 'General';
     $program = $_POST['program'] ?? '';
 
-    // ============ SECTION ASSIGNMENT ============
+    // Section assignment
     if (!empty($_POST['section'])) {
-        // Manual override (future admin-side enroll)
         $section = trim($_POST['section']);
     } else {
-        // Auto-assign based on current strand distribution
-        $section = assignProvisionalSection(
-            $conn,
-            $strand,
-            $grade_level,
-            $school_year,
-            35 // target per section; adjust if needed
-        );
+        $section = assignProvisionalSection($conn, $strand, $grade_level, $school_year, 35);
     }
-    // ============================================
 
     $household_id = $_POST['household_id'] ?? null;
     $is_transferred = isset($_POST['is_transferred']) ? 1 : 0;
@@ -522,7 +388,7 @@ try {
         $student_info_id,
         $school_year,
         $grade_level,
-        $semester,
+        $term,
         $track,
         $strand,
         $program,
@@ -539,24 +405,17 @@ try {
         $cct_4ps,
     ]);
 
-    if (!$stmt->execute()) {
-        throw new Exception("Execute failed for enrollment_form: " . $stmt->error);
-    }
+    if (!$stmt->execute()) throw new Exception("Execute failed for enrollment_form: " . $stmt->error);
     $stmt->close();
 
     // ============================================
     // 7. INSERT entrance document checkboxes (no file)
-    //
-    // Skip any label that has a matching uploaded file in section 8 —
-    // otherwise the admin view shows two rows for the same document.
     // ============================================
     $uploaded_labels = [];
     if (!empty($_SESSION['uploaded_files']) && is_array($_SESSION['uploaded_files'])) {
         foreach ($_SESSION['uploaded_files'] as $f) {
             $lbl = trim((string)($f['label'] ?? ''));
-            if ($lbl !== '') {
-                $uploaded_labels[$lbl] = true;
-            }
+            if ($lbl !== '') $uploaded_labels[$lbl] = true;
         }
     }
 
@@ -568,12 +427,9 @@ try {
         if ($doc_stmt) {
             foreach ($_POST['entrance_data'] as $document) {
                 $document = trim((string)$document);
-                if ($document === '') {
-                    continue;
-                }
-                if (isset($uploaded_labels[$document])) {
-                    continue; // section 8 will insert the file row
-                }
+                if ($document === '') continue;
+                if (isset($uploaded_labels[$document])) continue;
+
                 bind_params($doc_stmt, [$student_info_id, $document, 0]);
                 $doc_stmt->execute();
             }
@@ -583,11 +439,6 @@ try {
 
     // ============================================
     // 8. SAVE STAGED FILES — ENCRYPTED AT REST
-    //
-    // Files were previously held in $_SESSION as base64 blobs. They now
-    // live in STAGING_DIR as plaintext (short-lived); we read them here,
-    // encrypt with libsodium, write the .enc blob into DOCUMENTS_DIR
-    // (outside webroot), then delete the staged plaintext.
     // ============================================
     if (!empty($_SESSION['uploaded_files']) && is_array($_SESSION['uploaded_files'])) {
 
@@ -595,7 +446,6 @@ try {
             throw new Exception("Too many files uploaded (max 10).");
         }
 
-        // Prefer admin_id (what the admin login sets), fall back to user_id
         $uploaded_by = $_SESSION['admin_id'] ?? $_SESSION['user_id'] ?? null;
 
         if ($uploaded_by !== null) {
@@ -608,43 +458,30 @@ try {
                 VALUES (?, ?, 1, NOW(), ?, ?, ?)");
         }
 
-        if (!$file_stmt) {
-            throw new Exception("Prepare failed for file insert: " . $conn->error);
-        }
+        if (!$file_stmt) throw new Exception("Prepare failed for file insert: " . $conn->error);
 
         foreach ($_SESSION['uploaded_files'] as $doc_key => $info) {
             $label   = $info['label'] ?? $doc_key;
             $staging = $info['staging_path'] ?? '';
             $name    = $info['name'] ?? $label;
 
-            if ($staging === '' || !is_file($staging)) {
-                continue; // already consumed
-            }
+            if ($staging === '' || !is_file($staging)) continue;
 
             $stored = store_encrypted_file($staging, $student_info_id);
             $written_files[] = DOCUMENTS_DIR . $stored['filename'];
 
             $safe_name = preg_replace('/[^A-Za-z0-9._\- ]/', '_', $name);
-            if ($safe_name === '' || $safe_name === null) {
-                $safe_name = $stored['filename'];
-            }
+            if ($safe_name === '' || $safe_name === null) $safe_name = $stored['filename'];
 
             if ($uploaded_by !== null) {
                 bind_params($file_stmt, [
-                    $student_info_id,
-                    $label,
-                    $stored['filename'],
-                    $stored['mime'],
-                    $safe_name,
-                    (int)$uploaded_by,
+                    $student_info_id, $label, $stored['filename'],
+                    $stored['mime'], $safe_name, (int)$uploaded_by,
                 ]);
             } else {
                 bind_params($file_stmt, [
-                    $student_info_id,
-                    $label,
-                    $stored['filename'],
-                    $stored['mime'],
-                    $safe_name,
+                    $student_info_id, $label, $stored['filename'],
+                    $stored['mime'], $safe_name,
                 ]);
             }
 
@@ -656,12 +493,25 @@ try {
     }
 
     // ============================================
-    // COMMIT TRANSACTION
+    // COMMIT
     // ============================================
     $conn->commit();
     $conn->query("SELECT RELEASE_LOCK('enroll_global')");
 
-    // Rotate CSRF token after successful submission
+    // Audit log — only if an admin is logged in (student submissions skip)
+    if (!empty($_SESSION['admin_id'])) {
+        require_once __DIR__ . '/../config/audit.php';
+        audit_log($conn, 'student.enroll', [
+            'type'       => 'student',
+            'id'         => $student_info_id,
+            'student_id' => $student_id_number,
+            'sy'         => $school_year,
+            'grade'      => $grade_level,
+            'term'       => $term,
+        ]);
+    }
+
+    // Rotate CSRF token
     unset($_SESSION['csrf_token']);
 
     $_SESSION['success'] = true;
@@ -672,11 +522,11 @@ try {
         <strong>Birth Date:</strong> " . htmlspecialchars($birth_date) . "<br>
         <strong>School Year:</strong> " . htmlspecialchars($school_year) . "<br>
         <strong>Grade Level:</strong> " . htmlspecialchars($grade_level) . "<br>
+        <strong>Term:</strong> " . htmlspecialchars($term) . "<br>
         <strong>Strand:</strong> " . htmlspecialchars($strand) . "<br>
         <strong>Section:</strong> " . htmlspecialchars($section);
 
-    unset($_SESSION['form_data']);
-    unset($_SESSION['uploaded_files']);
+    unset($_SESSION['form_data'], $_SESSION['uploaded_files']);
 
     header('Location: enroll_form.php');
     exit();
@@ -685,14 +535,11 @@ try {
     $conn->rollback();
     $conn->query("SELECT RELEASE_LOCK('enroll_global')");
 
-    // Clean up any encrypted files we managed to write before the failure
+    // Clean up encrypted files written before the failure
     foreach ($written_files as $abs) {
-        if (file_exists($abs)) {
-            @unlink($abs);
-        }
+        if (file_exists($abs)) @unlink($abs);
     }
 
-    // Log full details, show only a correlation ID to the user
     $corr = bin2hex(random_bytes(4));
     error_log("Enrollment Error [{$corr}]: " . $e->getMessage());
     error_log("Error Trace [{$corr}]: " . $e->getTraceAsString());

@@ -1,11 +1,6 @@
 <?php
-session_start();
-include __DIR__ . "/../config/db.php";
-
-if (!isset($_SESSION['admin_id'])) {
-    header("Location: admin_login.php");
-    exit();
-}
+require_once __DIR__ . '/../config/auth.php';
+require_once __DIR__ . '/../config/audit.php';
 
 $current_page = basename($_SERVER['PHP_SELF']);
 
@@ -29,7 +24,6 @@ function strandInitials(string $strand): string {
 
 /**
  * Build display name: LastName, FirstName M.I. Ext.
- * Example: "Pable, Joshua A."  or  "Pable, Joshua A. Jr."
  */
 function formatStudentName(array $s): string {
     $mi  = !empty($s['middle_name']) ? ' ' . strtoupper(substr(trim($s['middle_name']), 0, 1)) . '.' : '';
@@ -41,6 +35,8 @@ function formatStudentName(array $s): string {
 // UPDATE SCHOOL YEAR AFTER PROMOTION
 // ────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_school_year'])) {
+    verify_csrf();
+
     $old_sy = trim($_POST['old_school_year'] ?? '');
     $new_sy = trim($_POST['new_school_year'] ?? '');
     
@@ -57,6 +53,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_school_year'])
             $updated = $stmt->affected_rows;
             $stmt->close();
             $conn->commit();
+
+            audit_log($conn, 'schoolyear.bulk_update', ['type'=>'school_year','from'=>$old_sy,'to'=>$new_sy,'affected'=>$updated]);
             
             if ($updated > 0) {
                 $_SESSION['success'] = "School year updated! $updated promoted student(s) moved from $old_sy to $new_sy.";
@@ -76,6 +74,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_school_year'])
 // PROMOTE SELECTED STUDENTS
 // ────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['promote_selected'])) {
+    verify_csrf();
+
     $selected_ids = $_POST['selected_students'] ?? [];
     $promote_sy = trim($_POST['promote_school_year'] ?? '');
     $new_school_year = trim($_POST['new_school_year'] ?? '');
@@ -109,7 +109,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['promote_selected'])) 
                         if ($upd->affected_rows > 0) $promoted_11++;
                         $upd->close();
                     } elseif ($result['grade_level'] === 'Grade 12') {
-                        // Graduate: keep grade_level = 'Grade 12' so grade snapshots stay correct
                         $upd = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', school_year = ? WHERE student_id = ? AND school_year = ? AND grade_level = 'Grade 12'");
                         $upd->bind_param("sis", $new_school_year, $sid, $promote_sy);
                         $upd->execute();
@@ -120,6 +119,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['promote_selected'])) 
             }
             
             $conn->commit();
+
+            audit_log($conn, 'student.promote', ['type'=>'batch','from_sy'=>$promote_sy,'to_sy'=>$new_school_year,'promoted'=>$promoted_11,'graduated'=>$graduated_12]);
             
             $msg = [];
             if ($promoted_11 > 0) $msg[] = "$promoted_11 → Grade 12";
@@ -164,7 +165,6 @@ if (isset($_GET['promote_students']) && isset($_GET['school_year']) && isset($_G
                 $stmt->close();
                 $_SESSION['success'] = $total_promoted > 0 ? "$total_promoted student(s) promoted from Grade 11 to Grade 12. School year updated to $new_school_year." : "No active Grade 11 students found.";
             } elseif ($promote_type === 'grade12') {
-                // Graduate: keep grade_level = 'Grade 12'
                 $stmt = $conn->prepare("UPDATE enrollment_form SET status = 'Graduated', school_year = ? WHERE grade_level = 'Grade 12' AND school_year = ? AND (status = 'Active' OR status IS NULL)");
                 $stmt->bind_param("ss", $new_school_year, $promote_sy);
                 $stmt->execute();
@@ -184,6 +184,9 @@ if (isset($_GET['promote_students']) && isset($_GET['school_year']) && isset($_G
             }
             
             $conn->commit();
+
+            audit_log($conn, 'student.promote_all', ['type'=>'batch','from_sy'=>$promote_sy,'to_sy'=>$new_school_year,'mode'=>$promote_type,'affected'=>$total_promoted]);
+
         } catch (Exception $e) {
             $conn->rollback();
             $_SESSION['error'] = "Promotion failed: " . $e->getMessage();
@@ -209,7 +212,7 @@ $per_page = 50;
 $offset = ($page - 1) * $per_page;
 
 // ────────────────────────────────────────────────
-// AUTO SECTION ASSIGNMENT — initials + letter
+// AUTO SECTION ASSIGNMENT
 // ────────────────────────────────────────────────
 if (isset($_GET['auto_assign'])) {
     if (empty($grade_level) || empty($school_year)) {
@@ -329,6 +332,8 @@ if (isset($_GET['auto_assign'])) {
                         $upd->close();
                         $conn->commit();
 
+                        audit_log($conn, 'section.auto_assign', ['type'=>'batch','grade'=>$grade_level,'sy'=>$school_year,'assigned'=>$total_assigned,'sections'=>$total_sections]);
+
                         $msg = "Auto-section complete: $total_assigned student(s) assigned to $total_sections section(s) for $grade_level - SY $school_year.";
                         if ($skipped_students > 0) {
                             $msg .= " Skipped " . count($skipped_groups) . " strand(s) (" . $skipped_students . " student(s)) that already had sections.";
@@ -351,7 +356,7 @@ if (isset($_GET['auto_assign'])) {
 }
 
 // ────────────────────────────────────────────────
-// MAIN STUDENTS QUERY — uses e.term now
+// MAIN STUDENTS QUERY
 // ────────────────────────────────────────────────
 $sql = "SELECT s.student_id, s.student_id_number, s.lrn, s.last_name, s.first_name, s.middle_name, s.ext_name, s.sex, s.age, e.grade_level, e.school_year, e.section, e.strand, e.track, e.program, e.term, COALESCE(e.status, 'Active') AS status, COUNT(*) OVER() as total_count FROM students_info s INNER JOIN enrollment_form e ON s.student_id = e.student_id WHERE 1=1";
 
@@ -429,166 +434,1096 @@ if (count($parts) === 2) {
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
     <style>
-        :root {--bg:#f1f5f9;--surface:#fff;--text:#1a1f36;--text2:#6b7280;--border:#e5e7eb;--accent:#4f46e5;--accent2:#6366f1;--green:#059669;--red:#dc2626;--amber:#d97706;--shadow:0 1px 3px rgba(0,0,0,0.06);--shadow-lg:0 10px 25px rgba(0,0,0,0.08);--radius:12px;--radius-lg:16px}
-        [data-bs-theme="dark"] {--bg:#0f172a;--surface:#1e293b;--text:#f1f5f9;--text2:#94a3b8;--border:#334155;--accent:#818cf8;--accent2:#6366f1;--shadow:0 1px 3px rgba(0,0,0,0.3);--shadow-lg:0 10px 25px rgba(0,0,0,0.5)}
-        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}body{background:var(--bg);color:var(--text);min-height:100vh}
-        .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
-        .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}.sidebar-brand img{width:40px;height:40px;border-radius:10px}.sidebar-brand span{font-weight:700;font-size:1.1rem}
-        .sidebar-nav{flex:1;padding:1rem 0.75rem;overflow-y:auto}.sidebar-nav a{display:flex;align-items:center;gap:0.75rem;padding:0.7rem 1rem;border-radius:10px;color:var(--text2);text-decoration:none;font-weight:500;font-size:0.9rem;transition:all 0.2s;margin-bottom:0.25rem}
-        .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}.sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}.sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
-        .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
-        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}.menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
-        .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.5rem}
-        .stat-card{background:var(--surface);border-radius:var(--radius);border:1px solid var(--border);box-shadow:var(--shadow);padding:1rem 1.25rem;text-align:center;transition:all 0.3s}.stat-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--accent)}.stat-value{font-size:1.6rem;font-weight:700;color:var(--accent)}.stat-label{font-size:0.72rem;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-top:0.2rem}
-        .card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);margin-bottom:1.25rem;overflow:hidden}
-        .card-header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}.card-header h3{margin:0;font-size:0.95rem;font-weight:600;display:flex;align-items:center;gap:0.5rem}.card-header h3 i{color:var(--accent)}.card-body{padding:1.5rem}.card-body.no-padding{padding:0}
-        .filter-bar{display:flex;gap:0.75rem;flex-wrap:wrap;align-items:center}.filter-bar input,.filter-bar select{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:0.5rem 1rem;font-size:0.85rem;color:var(--text);min-width:160px}
-        .table-admin{width:100%;border-collapse:collapse}.table-admin th{background:var(--bg);font-size:0.7rem;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;padding:0.75rem 1rem;text-align:left;border-bottom:2px solid var(--border)}.table-admin td{padding:0.7rem 1rem;border-bottom:1px solid var(--border);font-size:0.85rem;vertical-align:middle}.table-admin tr:hover td{background:rgba(79,70,229,0.03)}.table-admin tr:last-child td{border-bottom:none}
-        .student-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:1rem}
-        .student-card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);padding:1.25rem;transition:all 0.3s;display:flex;gap:1rem;align-items:flex-start;position:relative}.student-card:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg);border-color:var(--accent)}.student-card.selected{border-color:var(--amber);background:rgba(245,158,11,0.05);box-shadow:0 0 0 2px rgba(245,158,11,0.3)}.student-card .select-check{position:absolute;top:0.75rem;right:0.75rem;width:22px;height:22px;accent-color:var(--amber);cursor:pointer;z-index:2;transform:scale(1.3)}
-        .student-avatar{width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:1.2rem;flex-shrink:0}
-        .student-info{flex:1;min-width:0}.student-info h4{font-size:0.95rem;font-weight:600;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:30px}.student-info .meta{font-size:0.75rem;color:var(--text2);margin-top:0.25rem}.student-info .tags{display:flex;gap:0.35rem;flex-wrap:wrap;margin-top:0.5rem}
-        .tag{display:inline-block;padding:0.15rem 0.5rem;border-radius:20px;font-size:0.68rem;font-weight:600;background:var(--bg);color:var(--text2)}.tag.accent{background:#eef2ff;color:#4338ca}[data-bs-theme="dark"] .tag.accent{background:#312e81;color:#a5b4fc}.tag.promotable{background:#fef3c7;color:#92400e}[data-bs-theme="dark"] .tag.promotable{background:#78350f;color:#fcd34d}.tag.initials{background:#fce7f3;color:#9d174d;font-weight:700;letter-spacing:0.5px}[data-bs-theme="dark"] .tag.initials{background:#831843;color:#fbcfe8}
-        .status-dot{display:inline-flex;align-items:center;gap:0.3rem;font-size:0.72rem;font-weight:600}.status-dot::before{content:'';width:7px;height:7px;border-radius:50%}.status-dot.success::before{background:var(--green)}.status-dot.warning::before{background:var(--amber)}.status-dot.danger::before{background:var(--red)}
-        .promote-bar{background:linear-gradient(135deg,#fef3c7,#fde68a);border:2px solid #f59e0b;border-radius:var(--radius);padding:0.75rem 1.25rem;margin-bottom:1rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;position:sticky;top:0;z-index:50}[data-bs-theme="dark"] .promote-bar{background:linear-gradient(135deg,#78350f,#92400e);border-color:#f59e0b;color:#fef3c7}.promote-bar .selected-count{font-weight:700;font-size:1.1rem}
-        .btn-promote{background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff;border:none;font-weight:600;white-space:nowrap}.btn-promote:hover{background:linear-gradient(135deg,#d97706,#b45309);color:#fff;transform:translateY(-1px);box-shadow:0 4px 12px rgba(217,119,6,0.3)}
-        .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center}.theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}.btn{font-weight:500;border-radius:8px}
-        .pagination{display:flex;gap:0.35rem;align-items:center}.pagination .btn{min-width:36px}
-        @media(max-width:1024px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main-content{margin-left:0}.menu-toggle{display:flex}}@media(max-width:640px){.main-content{padding:1rem}.student-grid{grid-template-columns:1fr}.filter-bar{flex-direction:column}.filter-bar input,.filter-bar select{width:100%}.promote-bar{flex-direction:column;text-align:center}}
+        /* ============================================================
+           Design tokens (matches dashboard.php)
+           ============================================================ */
+        :root {
+            --bg: #f4f6fb;
+            --surface: #ffffff;
+            --surface-2: #f8fafc;
+            --text: #0f172a;
+            --text-2: #64748b;
+            --text-3: #94a3b8;
+            --border: #e5e7eb;
+            --border-strong: #d1d5db;
+            --accent: #4f46e5;
+            --accent-2: #6366f1;
+            --accent-soft: #eef2ff;
+            --green: #059669;
+            --green-soft: #d1fae5;
+            --red: #dc2626;
+            --red-soft: #fee2e2;
+            --amber: #d97706;
+            --amber-soft: #fef3c7;
+            --purple: #7c3aed;
+            --purple-soft: #ede9fe;
+            --blue: #2563eb;
+
+            --shadow-xs: 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-sm: 0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-md: 0 4px 12px rgba(15,23,42,0.06);
+            --shadow-lg: 0 12px 32px rgba(15,23,42,0.10);
+
+            --radius-sm: 8px;
+            --radius: 12px;
+            --radius-lg: 16px;
+            --radius-xl: 20px;
+
+            --sidebar-w: 264px;
+        }
+
+        [data-bs-theme="dark"] {
+            --bg: #0b1220;
+            --surface: #131c2e;
+            --surface-2: #1a2439;
+            --text: #f1f5f9;
+            --text-2: #94a3b8;
+            --text-3: #64748b;
+            --border: #1f2a44;
+            --border-strong: #2d3b57;
+            --accent: #818cf8;
+            --accent-2: #6366f1;
+            --accent-soft: #1e2140;
+            --green-soft: #052e24;
+            --red-soft: #3f1517;
+            --amber-soft: #3d2a08;
+            --purple-soft: #2e1a54;
+
+            --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.35);
+            --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+            --shadow-lg: 0 12px 32px rgba(0,0,0,0.55);
+        }
+
+        *{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;padding:0;box-sizing:border-box}
+        html,body{height:100%}
+        body{background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
+
+        /* ============================================================
+           Sidebar
+           ============================================================ */
+        .sidebar{
+            position:fixed;left:0;top:0;bottom:0;width:var(--sidebar-w);
+            background:var(--surface);border-right:1px solid var(--border);
+            z-index:200;display:flex;flex-direction:column;
+            transition:transform .28s cubic-bezier(.4,0,.2,1);
+        }
+        .sidebar-brand{
+            padding:1.25rem 1.5rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;gap:.75rem;
+        }
+        .sidebar-brand img{
+            width:38px;height:38px;border-radius:10px;object-fit:cover;
+            box-shadow:0 0 0 3px var(--accent-soft);
+        }
+        .sidebar-brand .brand-text{display:flex;flex-direction:column;line-height:1.15}
+        .sidebar-brand .brand-name{font-weight:700;font-size:.95rem;color:var(--text)}
+        .sidebar-brand .brand-sub{font-size:.68rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
+
+        .sidebar-nav{flex:1;padding:.75rem .75rem 1rem;overflow-y:auto}
+        .sidebar-nav .nav-label{
+            font-size:.65rem;font-weight:700;color:var(--text-3);
+            text-transform:uppercase;letter-spacing:.8px;
+            padding:.75rem .75rem .35rem;
+        }
+        .sidebar-nav a{
+            display:flex;align-items:center;gap:.75rem;
+            padding:.6rem .75rem;border-radius:10px;
+            color:var(--text-2);text-decoration:none;
+            font-weight:500;font-size:.875rem;
+            transition:background .15s, color .15s;
+            margin-bottom:.1rem;
+        }
+        .sidebar-nav a:hover{background:var(--surface-2);color:var(--text)}
+        .sidebar-nav a.active{background:var(--accent);color:#fff;box-shadow:0 4px 12px -4px rgba(79,70,229,.5)}
+        .sidebar-nav a.active:hover{background:var(--accent)}
+        .sidebar-nav a i{font-size:1.05rem;width:20px;text-align:center;flex-shrink:0}
+
+        .sidebar-footer{padding:.75rem;border-top:1px solid var(--border)}
+
+        /* ============================================================
+           Main content
+           ============================================================ */
+        .main-content{
+            margin-left:var(--sidebar-w);
+            padding:1.5rem clamp(1rem,2.5vw,2rem) 2rem;
+            min-height:100vh;
+            max-width:1600px;
+        }
+        .topbar{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:1.5rem;gap:1rem;flex-wrap:wrap;
+        }
+        .topbar h2{font-size:1.35rem;font-weight:700;letter-spacing:-.02em;margin:0}
+        .topbar .sub{font-size:.85rem;color:var(--text-2);margin:0}
+        .menu-toggle{
+            display:none;width:40px;height:40px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text);cursor:pointer;
+            align-items:center;justify-content:center;
+            transition:background .15s;
+        }
+        .menu-toggle:hover{background:var(--surface-2)}
+
+        /* ============================================================
+           Stat cards
+           ============================================================ */
+        .stat-grid{
+            display:grid;
+            grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+            gap:1rem;margin-bottom:1.5rem;
+        }
+        .stat-card{
+            position:relative;
+            background:var(--surface);border-radius:var(--radius-lg);
+            border:1px solid var(--border);box-shadow:var(--shadow-sm);
+            padding:1.1rem 1.25rem 1.1rem 1.4rem;
+            display:flex;align-items:center;gap:1rem;
+            transition:transform .2s, box-shadow .2s, border-color .2s;
+            overflow:hidden;
+        }
+        .stat-card::before{
+            content:'';position:absolute;left:0;top:0;bottom:0;width:4px;
+            background:var(--accent);
+        }
+        .stat-card.tone-blue::before{background:var(--accent)}
+        .stat-card.tone-green::before{background:var(--green)}
+        .stat-card.tone-red::before{background:var(--red)}
+        .stat-card.tone-purple::before{background:var(--purple)}
+        .stat-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg);border-color:var(--border-strong)}
+
+        .stat-icon{
+            width:42px;height:42px;border-radius:12px;
+            display:flex;align-items:center;justify-content:center;
+            font-size:1.1rem;flex-shrink:0;
+            background:var(--accent-soft);color:var(--accent);
+        }
+        .tone-green  .stat-icon{background:var(--green-soft);color:var(--green)}
+        .tone-red    .stat-icon{background:var(--red-soft);color:var(--red)}
+        .tone-purple .stat-icon{background:var(--purple-soft);color:var(--purple)}
+
+        .stat-info{min-width:0;flex:1}
+        .stat-info .stat-value{
+            font-size:1.55rem;font-weight:700;line-height:1.1;
+            letter-spacing:-.02em;font-variant-numeric:tabular-nums;
+        }
+        .stat-info .stat-label{
+            font-size:.7rem;color:var(--text-2);text-transform:uppercase;
+            letter-spacing:.6px;margin-top:.2rem;font-weight:600;
+        }
+
+        /* ============================================================
+           Cards
+           ============================================================ */
+        .card{
+            background:var(--surface);border-radius:var(--radius-lg);
+            border:1px solid var(--border);box-shadow:var(--shadow-sm);
+            margin-bottom:1.25rem;overflow:hidden;
+        }
+        .card-header{
+            padding:.9rem 1.25rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;justify-content:space-between;
+            gap:1rem;flex-wrap:wrap;background:var(--surface);
+        }
+        .card-header h3{
+            margin:0;font-size:.9rem;font-weight:600;
+            display:flex;align-items:center;gap:.5rem;color:var(--text);
+        }
+        .card-header h3 i{color:var(--accent);font-size:1rem}
+        .card-header .hint{font-size:.75rem;color:var(--text-2);font-weight:500}
+        .card-body{padding:1.25rem}
+        .card-body.no-padding{padding:0}
+
+        /* ============================================================
+           Filter bar
+           ============================================================ */
+        .filter-bar{
+            display:grid;
+            grid-template-columns:minmax(200px,1.6fr) minmax(140px,1fr) minmax(140px,1fr) minmax(140px,1fr) auto;
+            gap:.75rem;align-items:end;width:100%;
+        }
+        .filter-bar .field{display:flex;flex-direction:column;gap:.3rem;min-width:0}
+        .filter-bar label{
+            font-size:.68rem;font-weight:700;color:var(--text-2);
+            text-transform:uppercase;letter-spacing:.5px;
+        }
+        .filter-bar input,.filter-bar select{
+            background:var(--surface-2);border:1px solid var(--border);
+            border-radius:10px;padding:.5rem .8rem;font-size:.85rem;
+            color:var(--text);font-family:inherit;width:100%;
+            transition:border-color .15s, box-shadow .15s, background .15s;
+        }
+        .filter-bar input::placeholder{color:var(--text-3)}
+        .filter-bar input:focus,.filter-bar select:focus{
+            border-color:var(--accent);background:var(--surface);
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+            outline:none;
+        }
+        .filter-bar .actions{display:flex;gap:.5rem;flex-wrap:nowrap}
+        .filter-extra{
+            display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;
+            margin-top:.85rem;padding-top:.85rem;border-top:1px dashed var(--border);
+        }
+        .promote-hint{
+            font-size:.78rem;color:var(--text-2);
+            display:flex;align-items:center;gap:.35rem;
+            padding:.5rem .75rem;background:var(--surface-2);
+            border-radius:10px;border:1px solid var(--border);
+        }
+
+        /* ============================================================
+           Table (sections)
+           ============================================================ */
+        .table-scroll{overflow-x:auto}
+        .table-admin{width:100%;border-collapse:separate;border-spacing:0}
+        .table-admin thead th{
+            background:var(--surface-2);
+            font-size:.68rem;font-weight:700;color:var(--text-2);
+            text-transform:uppercase;letter-spacing:.6px;
+            padding:.7rem 1rem;text-align:left;
+            border-bottom:1px solid var(--border);
+            white-space:nowrap;
+        }
+        .table-admin tbody td{
+            padding:.65rem 1rem;border-bottom:1px solid var(--border);
+            font-size:.85rem;vertical-align:middle;
+            transition:background .12s;
+        }
+        .table-admin tbody tr:hover td{background:color-mix(in srgb, var(--accent) 4%, transparent)}
+        .table-admin tbody tr:last-child td{border-bottom:none}
+        .cell-strong{font-weight:600;color:var(--text)}
+        .cell-muted{color:var(--text-2);font-size:.82rem}
+        .cell-center{text-align:center}
+        .cell-num{
+            font-variant-numeric:tabular-nums;font-weight:600;
+            color:var(--text);font-size:.85rem;
+        }
+        .cell-male{color:var(--blue);font-weight:600;font-variant-numeric:tabular-nums}
+        .cell-female{color:var(--red);font-weight:600;font-variant-numeric:tabular-nums}
+
+        /* ============================================================
+           Student cards grid
+           ============================================================ */
+        .student-grid{
+            display:grid;
+            grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+            gap:1rem;
+        }
+        .student-card{
+            background:var(--surface);border-radius:var(--radius-lg);
+            border:1px solid var(--border);box-shadow:var(--shadow-xs);
+            padding:1.1rem 1.15rem;
+            display:flex;gap:.9rem;align-items:flex-start;
+            position:relative;
+            transition:transform .18s, box-shadow .18s, border-color .18s;
+        }
+        .student-card:hover{
+            transform:translateY(-2px);
+            box-shadow:var(--shadow-md);
+            border-color:var(--border-strong);
+        }
+        .student-card.selected{
+            border-color:var(--amber);
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--amber) 22%, transparent);
+            background:color-mix(in srgb, var(--amber) 5%, var(--surface));
+        }
+        .student-card .select-check{
+            position:absolute;top:.85rem;right:.85rem;
+            width:20px;height:20px;
+            accent-color:var(--amber);cursor:pointer;z-index:2;
+        }
+
+        .student-avatar{
+            width:48px;height:48px;border-radius:50%;
+            background:linear-gradient(135deg,var(--accent),var(--accent-2));
+            display:flex;align-items:center;justify-content:center;
+            color:#fff;font-weight:700;font-size:1.05rem;flex-shrink:0;
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
+        }
+
+        .student-info{flex:1;min-width:0}
+        .student-info h4{
+            font-size:.92rem;font-weight:600;margin:0 0 .15rem;
+            white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+            padding-right:1.6rem;color:var(--text);
+        }
+        .student-info .meta{
+            font-size:.74rem;color:var(--text-2);
+            font-variant-numeric:tabular-nums;
+        }
+        .student-info .tags{
+            display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.6rem;
+        }
+
+        .tag{
+            display:inline-flex;align-items:center;gap:.25rem;
+            padding:.18rem .55rem;border-radius:999px;
+            font-size:.68rem;font-weight:600;
+            background:var(--surface-2);color:var(--text-2);
+            border:1px solid var(--border);
+            white-space:nowrap;
+        }
+        .tag.accent{
+            background:var(--accent-soft);color:var(--accent);
+            border-color:color-mix(in srgb, var(--accent) 22%, transparent);
+        }
+        .tag.promotable{
+            background:var(--amber-soft);color:var(--amber);
+            border-color:color-mix(in srgb, var(--amber) 25%, transparent);
+        }
+        .tag.initials{
+            background:var(--purple-soft);color:var(--purple);
+            border-color:color-mix(in srgb, var(--purple) 22%, transparent);
+            font-weight:700;letter-spacing:.4px;
+        }
+
+        /* ============================================================
+           Status pills
+           ============================================================ */
+        .pill{
+            display:inline-flex;align-items:center;gap:.4rem;
+            padding:.22rem .6rem;border-radius:999px;
+            font-size:.7rem;font-weight:600;
+            border:1px solid transparent;
+        }
+        .pill::before{
+            content:'';width:6px;height:6px;border-radius:50%;
+            background:currentColor;opacity:.9;
+        }
+        .pill.success{background:var(--green-soft);color:var(--green)}
+        .pill.warning{background:var(--amber-soft);color:var(--amber)}
+        .pill.danger {background:var(--red-soft);  color:var(--red)}
+        .pill.muted  {background:var(--surface-2); color:var(--text-2)}
+
+        /* ============================================================
+           Promote bar (sticky)
+           ============================================================ */
+        .promote-bar{
+            position:sticky;top:.75rem;z-index:50;
+            background:linear-gradient(135deg,#fbbf24,#d97706);
+            color:#fff;
+            border-radius:var(--radius);
+            padding:.85rem 1.15rem;
+            margin-bottom:1rem;
+            display:flex;align-items:center;justify-content:space-between;
+            gap:1rem;flex-wrap:wrap;
+            box-shadow:0 8px 24px -8px rgba(217,119,6,.6);
+            border:1px solid rgba(255,255,255,.15);
+        }
+        [data-bs-theme="dark"] .promote-bar{
+            background:linear-gradient(135deg,#92400e,#78350f);
+            border-color:rgba(251,191,36,.35);
+        }
+        .promote-bar .selected-count{font-weight:700;font-size:1.15rem;line-height:1}
+        .promote-bar .selected-label{font-size:.78rem;opacity:.9;margin-top:.15rem}
+        .promote-bar input.form-control{
+            background:rgba(255,255,255,.95);border:1px solid rgba(0,0,0,.08);
+            color:#0f172a;font-weight:500;
+        }
+        .promote-bar input.form-control:focus{
+            box-shadow:0 0 0 3px rgba(255,255,255,.35);border-color:transparent;
+        }
+
+        .btn-promote{
+            background:#0f172a;color:#fff;border:none;font-weight:600;
+            transition:all .15s;
+        }
+        .btn-promote:hover:not(:disabled){background:#1e293b;color:#fff;transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.25)}
+        .btn-promote:disabled{opacity:.5;cursor:not-allowed}
+
+        /* ============================================================
+           Buttons
+           ============================================================ */
+        .btn{font-weight:500;border-radius:9px;font-size:.82rem;transition:all .15s}
+        .btn-primary{background:var(--accent);border-color:var(--accent)}
+        .btn-primary:hover{background:var(--accent-2);border-color:var(--accent-2)}
+        .btn-outline-primary{color:var(--accent);border-color:var(--border-strong)}
+        .btn-outline-primary:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+        .btn-outline-secondary{color:var(--text-2);border-color:var(--border)}
+        .btn-outline-secondary:hover{background:var(--surface-2);color:var(--text);border-color:var(--border-strong)}
+        .btn-outline-warning{color:var(--amber);border-color:color-mix(in srgb, var(--amber) 40%, transparent)}
+        .btn-outline-warning:hover{background:var(--amber);color:#fff;border-color:var(--amber)}
+        .btn-success{background:var(--green);border-color:var(--green)}
+        .btn-success:hover{background:#047857;border-color:#047857}
+        .btn-icon{
+            width:32px;height:32px;padding:0;
+            display:inline-flex;align-items:center;justify-content:center;
+            border-radius:9px;
+        }
+        .theme-btn{
+            width:38px;height:38px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text-2);cursor:pointer;
+            display:flex;align-items:center;justify-content:center;
+            transition:all .15s;
+        }
+        .theme-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+
+        /* ============================================================
+           Pagination
+           ============================================================ */
+        .pagination{
+            display:inline-flex;align-items:center;gap:.25rem;
+            background:var(--surface);border:1px solid var(--border);
+            border-radius:10px;padding:.25rem;
+        }
+        .pagination .btn{
+            border:none;color:var(--text-2);
+            min-width:34px;padding:.35rem .55rem;
+        }
+        .pagination .btn:hover:not(:disabled){background:var(--surface-2);color:var(--text)}
+        .pagination .btn:disabled{opacity:.4;cursor:not-allowed}
+        .pagination .page-info{
+            font-size:.78rem;color:var(--text-2);
+            padding:0 .65rem;font-weight:500;
+        }
+
+        /* ============================================================
+           Empty state
+           ============================================================ */
+        .empty{
+            padding:3rem 1.5rem;text-align:center;color:var(--text-2);
+        }
+        .empty .empty-icon{
+            width:64px;height:64px;border-radius:50%;
+            background:var(--surface-2);color:var(--text-3);
+            display:inline-flex;align-items:center;justify-content:center;
+            font-size:1.6rem;margin-bottom:1rem;
+        }
+        .empty .empty-title{font-weight:600;color:var(--text);margin-bottom:.25rem}
+        .empty .empty-sub{font-size:.85rem;color:var(--text-2)}
+
+        /* ============================================================
+           Alerts
+           ============================================================ */
+        .flash{
+            display:flex;align-items:center;gap:.65rem;
+            padding:.75rem 1rem;border-radius:var(--radius);
+            margin-bottom:1rem;font-size:.88rem;font-weight:500;
+            border:1px solid transparent;
+        }
+        .flash.success{background:var(--green-soft);color:var(--green);border-color:color-mix(in srgb, var(--green) 25%, transparent)}
+        .flash.error  {background:var(--red-soft);  color:var(--red);  border-color:color-mix(in srgb, var(--red) 25%, transparent)}
+        .flash.info   {background:var(--accent-soft);color:var(--accent);border-color:color-mix(in srgb, var(--accent) 25%, transparent)}
+        .flash .btn-close{margin-left:auto;opacity:.6}
+
+        /* ============================================================
+           Modal
+           ============================================================ */
+        .modal-content{border-radius:var(--radius-lg);border:none;box-shadow:var(--shadow-lg)}
+        .modal-header.promote-head{
+            background:linear-gradient(135deg,#fbbf24,#d97706);color:#fff;
+            border-top-left-radius:var(--radius-lg);border-top-right-radius:var(--radius-lg);
+            padding:1rem 1.25rem;border-bottom:none;
+        }
+        .modal-header.promote-head .btn-close{filter:brightness(0) invert(1);opacity:.85}
+        .modal-body{padding:1.25rem}
+        .modal-footer{padding:.85rem 1.25rem;border-top:1px solid var(--border)}
+        .form-label{font-size:.78rem;font-weight:600;color:var(--text-2);margin-bottom:.35rem}
+        .form-control,.form-select{
+            background:var(--surface-2);border:1px solid var(--border);
+            border-radius:10px;padding:.5rem .8rem;font-size:.85rem;
+            color:var(--text);transition:border-color .15s, box-shadow .15s;
+        }
+        .form-control:focus,.form-select:focus{
+            border-color:var(--accent);background:var(--surface);
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+        }
+        .form-text{font-size:.72rem;color:var(--text-3)}
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width:1280px){
+            .filter-bar{grid-template-columns:minmax(200px,1.6fr) 1fr 1fr auto}
+            .filter-bar .field:nth-child(4){grid-column:span 1}
+            .filter-bar .actions{grid-column:1 / -1;justify-content:flex-end;margin-top:.25rem}
+        }
+        @media (max-width:1024px){
+            .sidebar{transform:translateX(-100%)}
+            .sidebar.open{transform:translateX(0)}
+            .main-content{margin-left:0}
+            .menu-toggle{display:flex}
+        }
+        @media (max-width:900px){
+            .filter-bar{grid-template-columns:1fr 1fr}
+            .filter-bar .actions{grid-column:span 2;justify-content:stretch}
+            .filter-bar .actions .btn{flex:1}
+        }
+        @media (max-width:640px){
+            .stat-grid{grid-template-columns:repeat(2,1fr);gap:.75rem}
+            .stat-card{padding:1rem 1rem 1rem 1.1rem;gap:.75rem}
+            .stat-icon{width:36px;height:36px;font-size:.95rem}
+            .stat-info .stat-value{font-size:1.3rem}
+            .filter-bar{grid-template-columns:1fr}
+            .filter-bar .actions{grid-column:span 1}
+            .student-grid{grid-template-columns:1fr}
+            .promote-bar{flex-direction:column;align-items:stretch;text-align:center}
+            .promote-bar .d-flex{justify-content:center;flex-wrap:wrap}
+        }
     </style>
 </head>
 <body>
 
+<!-- ================= Sidebar ================= -->
 <aside class="sidebar" id="sidebar">
-    <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
+    <div class="sidebar-brand">
+        <img src="../assets/img/usat.jpg" alt="USAT" onerror="this.style.background='var(--accent)'">
+        <div class="brand-text">
+            <span class="brand-name">USAT Admin</span>
+            <span class="brand-sub">Enrollment System</span>
+        </div>
+    </div>
     <nav class="sidebar-nav">
+        <div class="nav-label">Overview</div>
         <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
         <a href="student_profile.php" class="active"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
+        <div class="nav-label" style="margin-top:.5rem">Administration</div>
         <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
     </nav>
-    <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
+    <div class="sidebar-footer">
+        <a href="logout.php" class="btn btn-outline-danger btn-sm w-100">
+            <i class="bi bi-box-arrow-right me-1"></i> Logout
+        </a>
+    </div>
 </aside>
 
 <div class="main-content" id="mainContent">
-    <?php if(isset($_SESSION['success'])): ?><div class="alert alert-success alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-check-circle-fill fs-5"></i> <?= $_SESSION['success'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['success']); endif; ?>
-    <?php if(isset($_SESSION['error'])): ?><div class="alert alert-danger alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-exclamation-triangle-fill fs-5"></i> <?= $_SESSION['error'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['error']); endif; ?>
-    <?php if(isset($_SESSION['info'])): ?><div class="alert alert-info alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-info-circle-fill fs-5"></i> <?= $_SESSION['info'] ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php unset($_SESSION['info']); endif; ?>
 
+    <!-- ================= Alerts ================= -->
+    <?php if(isset($_SESSION['success'])): ?>
+        <div class="flash success">
+            <i class="bi bi-check-circle-fill"></i>
+            <span><?= htmlspecialchars($_SESSION['success']) ?></span>
+            <button class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        <?php unset($_SESSION['success']); endif; ?>
+    <?php if(isset($_SESSION['error'])): ?>
+        <div class="flash error">
+            <i class="bi bi-exclamation-triangle-fill"></i>
+            <span><?= htmlspecialchars($_SESSION['error']) ?></span>
+            <button class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        <?php unset($_SESSION['error']); endif; ?>
+    <?php if(isset($_SESSION['info'])): ?>
+        <div class="flash info">
+            <i class="bi bi-info-circle-fill"></i>
+            <span><?= htmlspecialchars($_SESSION['info']) ?></span>
+            <button class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        <?php unset($_SESSION['info']); endif; ?>
+
+    <!-- ================= Top Bar ================= -->
     <div class="topbar">
-        <div class="d-flex align-items-center gap-3"><button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button><div><h2 style="font-size:1.4rem;font-weight:700;margin:0">Student Profiles</h2><p class="text-muted small mb-0">Manage enrolled students</p></div></div>
-        <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+        <div class="d-flex align-items-center gap-3">
+            <button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button>
+            <div>
+                <h2>Student Profiles</h2>
+                <p class="sub">Manage enrolled students, sections, and promotions</p>
+            </div>
+        </div>
+        <button class="theme-btn" id="themeToggle" title="Toggle theme">
+            <i class="bi bi-moon-stars-fill" id="themeIcon"></i>
+        </button>
     </div>
 
-    <div class="stat-grid"><div class="stat-card"><div class="stat-value"><?= number_format($total_students) ?></div><div class="stat-label">Total Students</div></div><div class="stat-card"><div class="stat-value"><?= number_format($boys) ?></div><div class="stat-label">Boys</div></div><div class="stat-card"><div class="stat-value"><?= number_format($girls) ?></div><div class="stat-label">Girls</div></div><div class="stat-card"><div class="stat-value"><?= count($all_sections) ?></div><div class="stat-label">Sections</div></div></div>
-
-    <div class="card"><div class="card-header"><h3><i class="bi bi-funnel"></i> Filters</h3></div><div class="card-body">
-        <form class="filter-bar" method="GET" id="filterForm">
-            <input type="hidden" name="page" value="1">
-            <input type="text" name="search" placeholder="Search name, LRN, ID..." value="<?= htmlspecialchars($search) ?>">
-            <select name="grade_level"><option value="">All Grades</option><?php while($gl=$grade_levels->fetch_assoc()): ?><option value="<?= htmlspecialchars($gl['grade_level']) ?>" <?= $gl['grade_level']===$grade_level?'selected':'' ?>><?= htmlspecialchars($gl['grade_level']) ?></option><?php endwhile; ?></select>
-            <select name="school_year"><option value="">All Years</option><?php while($sy=$school_years->fetch_assoc()): ?><option value="<?= htmlspecialchars($sy['school_year']) ?>" <?= $sy['school_year']===$school_year?'selected':'' ?>><?= htmlspecialchars($sy['school_year']) ?></option><?php endwhile; ?></select>
-            <select name="status"><option value="">All Status</option><?php foreach($possible_statuses as $st): ?><option value="<?= $st ?>" <?= $st===$status?'selected':'' ?>><?= $st ?></option><?php endforeach; ?></select>
-            <button type="submit" class="btn btn-primary btn-sm">Filter</button>
-            <a href="student_profile.php" class="btn btn-outline-secondary btn-sm">Reset</a>
-            <button type="submit" name="auto_assign" value="1" class="btn btn-success btn-sm"><i class="bi bi-magic me-1"></i> Auto Section</button>
-            <?php if ($school_year && ($promote_preview_11 > 0 || $promote_preview_12 > 0)): ?>
-            <div class="dropdown">
-                <button class="btn btn-promote btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown"><i class="bi bi-rocket-takeoff me-1"></i> Promote All <span class="badge bg-light text-dark ms-1"><?= $promote_preview_11 + $promote_preview_12 ?></span></button>
-                <ul class="dropdown-menu shadow-lg border-0 rounded-3">
-                    <?php if ($promote_preview_11 > 0): ?><li><a class="dropdown-item" href="#" onclick="showPromoteModal('grade11')"><i class="bi bi-arrow-up-circle text-warning me-2"></i> Promote Grade 11 → 12 <span class="badge bg-warning text-dark ms-2"><?= $promote_preview_11 ?></span></a></li><?php endif; ?>
-                    <?php if ($promote_preview_12 > 0): ?><li><a class="dropdown-item" href="#" onclick="showPromoteModal('grade12')"><i class="bi bi-mortarboard text-success me-2"></i> Graduate Grade 12 <span class="badge bg-success ms-2"><?= $promote_preview_12 ?></span></a></li><?php endif; ?>
-                    <?php if ($promote_preview_11 > 0 && $promote_preview_12 > 0): ?><li><hr class="dropdown-divider"></li><li><a class="dropdown-item" href="#" onclick="showPromoteModal('both')"><i class="bi bi-rocket-takeoff text-primary me-2"></i> Promote Both <span class="badge bg-primary ms-2"><?= $promote_preview_11 + $promote_preview_12 ?></span></a></li><?php endif; ?>
-                </ul>
+    <!-- ================= Stats ================= -->
+    <div class="stat-grid">
+        <div class="stat-card tone-blue">
+            <div class="stat-icon"><i class="bi bi-people-fill"></i></div>
+            <div class="stat-info">
+                <div class="stat-value"><?= number_format($total_students) ?></div>
+                <div class="stat-label">Total Students</div>
             </div>
-            <a href="?school_year=<?= urlencode($school_year) ?>&grade_level=<?= urlencode($grade_level) ?>&status=Active&show_promotable=1" class="btn btn-outline-warning btn-sm"><i class="bi bi-list-check me-1"></i> Select to Promote</a>
-            <?php endif; ?>
-        </form>
-        <?php if ($school_year && ($promote_preview_11 > 0 || $promote_preview_12 > 0)): ?>
-        <div class="mt-2 small text-muted"><i class="bi bi-info-circle me-1"></i> <?= $promote_preview_11 > 0 ? "<strong>$promote_preview_11</strong> Grade 11 → 12" : "" ?><?= $promote_preview_11 > 0 && $promote_preview_12 > 0 ? " • " : "" ?><?= $promote_preview_12 > 0 ? "<strong>$promote_preview_12</strong> Grade 12 → Graduated" : "" ?> ready for <strong><?= htmlspecialchars($school_year) ?></strong></div>
-        <?php endif; ?>
-    </div></div>
+        </div>
+        <div class="stat-card tone-blue">
+            <div class="stat-icon"><i class="bi bi-gender-male"></i></div>
+            <div class="stat-info">
+                <div class="stat-value"><?= number_format($boys) ?></div>
+                <div class="stat-label">Male</div>
+            </div>
+        </div>
+        <div class="stat-card tone-red">
+            <div class="stat-icon"><i class="bi bi-gender-female"></i></div>
+            <div class="stat-info">
+                <div class="stat-value"><?= number_format($girls) ?></div>
+                <div class="stat-label">Female</div>
+            </div>
+        </div>
+        <div class="stat-card tone-purple">
+            <div class="stat-icon"><i class="bi bi-diagram-3"></i></div>
+            <div class="stat-info">
+                <div class="stat-value"><?= number_format(count($all_sections)) ?></div>
+                <div class="stat-label">Sections</div>
+            </div>
+        </div>
+    </div>
 
-    <?php if(!empty($all_sections) && !$show_promote_mode): ?>
-    <div class="card"><div class="card-header"><h3><i class="bi bi-diagram-3"></i> Sections (<?= count($all_sections) ?>)</h3></div><div class="card-body no-padding"><table class="table-admin"><thead><tr><th>Section</th><th class="text-center">Total</th><th class="text-center">Boys</th><th class="text-center">Girls</th><th class="text-center">Action</th></tr></thead><tbody><?php foreach($all_sections as $sec): ?><tr><td class="fw-bold"><?= htmlspecialchars($sec['section']) ?></td><td class="fw-semibold text-center"><?= $sec['total'] ?></td><td class="text-center" style="color:var(--blue)"><?= $sec['boys']??0 ?></td><td class="text-center" style="color:var(--red)"><?= $sec['girls']??0 ?></td><td class="text-center"><a href="sections_list.php?section=<?= urlencode($sec['section']) ?>" class="btn btn-outline-primary btn-xs"><i class="bi bi-eye me-1"></i> View</a></td></tr><?php endforeach; ?></tbody></table></div></div>
-    <?php endif; ?>
-
+    <!-- ================= Filters ================= -->
     <div class="card">
         <div class="card-header">
-            <h3><i class="bi bi-people"></i> Students (<?= $total_students ?>)</h3>
-            <div class="d-flex gap-2 align-items-center">
-                <?php if ($show_promote_mode): ?><button class="btn btn-outline-secondary btn-sm" onclick="selectAll()"><i class="bi bi-check-all me-1"></i> Select All</button><button class="btn btn-outline-secondary btn-sm" onclick="deselectAll()"><i class="bi bi-x-circle me-1"></i> Deselect All</button><a href="?school_year=<?= urlencode($school_year) ?>&grade_level=<?= urlencode($grade_level) ?>" class="btn btn-outline-secondary btn-sm">Cancel</a><?php endif; ?>
-                <?php if ($total_pages > 1): ?><div class="pagination ms-3"><?php if ($page > 1): ?><a href="<?= $base_url ?>&page=1" class="btn btn-outline-secondary btn-xs" title="First"><i class="bi bi-chevron-double-left"></i></a><?php endif; ?><?php if ($page > 1): ?><a href="<?= $base_url ?>&page=<?= $page-1 ?>" class="btn btn-outline-secondary btn-xs"><i class="bi bi-chevron-left"></i></a><?php endif; ?><span class="text-muted small px-2">Page <?= $page ?> of <?= $total_pages ?></span><?php if ($page < $total_pages): ?><a href="<?= $base_url ?>&page=<?= $page+1 ?>" class="btn btn-outline-secondary btn-xs"><i class="bi bi-chevron-right"></i></a><?php endif; ?><?php if ($page < $total_pages): ?><a href="<?= $base_url ?>&page=<?= $total_pages ?>" class="btn btn-outline-secondary btn-xs" title="Last"><i class="bi bi-chevron-double-right"></i></a><?php endif; ?></div><?php endif; ?>
+            <h3><i class="bi bi-funnel"></i> Filters</h3>
+            <?php if ($search || $grade_level || $school_year || $status): ?>
+                <span class="hint"><i class="bi bi-funnel-fill me-1"></i> Active filters applied</span>
+            <?php endif; ?>
+        </div>
+        <div class="card-body">
+            <form class="filter-bar" method="GET" id="filterForm">
+                <input type="hidden" name="page" value="1">
+
+                <div class="field">
+                    <label for="f_search">Search</label>
+                    <input type="text" id="f_search" name="search" placeholder="Name, LRN, or student ID" value="<?= htmlspecialchars($search) ?>">
+                </div>
+
+                <div class="field">
+                    <label for="f_grade">Grade Level</label>
+                    <select id="f_grade" name="grade_level">
+                        <option value="">All Grades</option>
+                        <?php while($gl=$grade_levels->fetch_assoc()): ?>
+                            <option value="<?= htmlspecialchars($gl['grade_level']) ?>" <?= $gl['grade_level']===$grade_level?'selected':'' ?>>
+                                <?= htmlspecialchars($gl['grade_level']) ?>
+                            </option>
+                        <?php endwhile; ?>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="f_sy">School Year</label>
+                    <select id="f_sy" name="school_year">
+                        <option value="">All Years</option>
+                        <?php while($sy=$school_years->fetch_assoc()): ?>
+                            <option value="<?= htmlspecialchars($sy['school_year']) ?>" <?= $sy['school_year']===$school_year?'selected':'' ?>>
+                                <?= htmlspecialchars($sy['school_year']) ?>
+                            </option>
+                        <?php endwhile; ?>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label for="f_status">Status</label>
+                    <select id="f_status" name="status">
+                        <option value="">All Status</option>
+                        <?php foreach($possible_statuses as $st): ?>
+                            <option value="<?= $st ?>" <?= $st===$status?'selected':'' ?>><?= $st ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div class="actions">
+                    <button type="submit" class="btn btn-primary btn-sm">
+                        <i class="bi bi-funnel me-1"></i> Filter
+                    </button>
+                    <a href="student_profile.php" class="btn btn-outline-secondary btn-sm">
+                        <i class="bi bi-x-circle me-1"></i> Reset
+                    </a>
+                </div>
+            </form>
+
+            <?php if ($school_year && ($promote_preview_11 > 0 || $promote_preview_12 > 0)): ?>
+                <div class="filter-extra">
+                    <button type="submit" form="filterForm" name="auto_assign" value="1" class="btn btn-success btn-sm">
+                        <i class="bi bi-magic me-1"></i> Auto Assign Sections
+                    </button>
+
+                    <div class="dropdown">
+                        <button class="btn btn-promote btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown">
+                            <i class="bi bi-rocket-takeoff me-1"></i> Promote All
+                            <span class="badge bg-light text-dark ms-1"><?= $promote_preview_11 + $promote_preview_12 ?></span>
+                        </button>
+                        <ul class="dropdown-menu shadow-lg border-0 rounded-3 p-2">
+                            <?php if ($promote_preview_11 > 0): ?>
+                                <li>
+                                    <a class="dropdown-item rounded-2 py-2" href="#" onclick="showPromoteModal('grade11');return false;">
+                                        <i class="bi bi-arrow-up-circle text-warning me-2"></i>
+                                        Promote Grade 11 → 12
+                                        <span class="badge bg-warning text-dark ms-2"><?= $promote_preview_11 ?></span>
+                                    </a>
+                                </li>
+                            <?php endif; ?>
+                            <?php if ($promote_preview_12 > 0): ?>
+                                <li>
+                                    <a class="dropdown-item rounded-2 py-2" href="#" onclick="showPromoteModal('grade12');return false;">
+                                        <i class="bi bi-mortarboard text-success me-2"></i>
+                                        Graduate Grade 12
+                                        <span class="badge bg-success ms-2"><?= $promote_preview_12 ?></span>
+                                    </a>
+                                </li>
+                            <?php endif; ?>
+                            <?php if ($promote_preview_11 > 0 && $promote_preview_12 > 0): ?>
+                                <li><hr class="dropdown-divider my-1"></li>
+                                <li>
+                                    <a class="dropdown-item rounded-2 py-2" href="#" onclick="showPromoteModal('both');return false;">
+                                        <i class="bi bi-rocket-takeoff text-primary me-2"></i>
+                                        Promote Both
+                                        <span class="badge bg-primary ms-2"><?= $promote_preview_11 + $promote_preview_12 ?></span>
+                                    </a>
+                                </li>
+                            <?php endif; ?>
+                        </ul>
+                    </div>
+
+                    <a href="?school_year=<?= urlencode($school_year) ?>&grade_level=<?= urlencode($grade_level) ?>&status=Active&show_promotable=1" class="btn btn-outline-warning btn-sm">
+                        <i class="bi bi-list-check me-1"></i> Select Manually
+                    </a>
+
+                    <div class="promote-hint ms-auto">
+                        <i class="bi bi-info-circle"></i>
+                        <span>
+                            <?php if ($promote_preview_11 > 0): ?><strong><?= $promote_preview_11 ?></strong> G11 → 12<?php endif; ?>
+                            <?php if ($promote_preview_11 > 0 && $promote_preview_12 > 0): ?> · <?php endif; ?>
+                            <?php if ($promote_preview_12 > 0): ?><strong><?= $promote_preview_12 ?></strong> G12 → Grad<?php endif; ?>
+                            ready for <strong><?= htmlspecialchars($school_year) ?></strong>
+                        </span>
+                    </div>
+                </div>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ================= Sections ================= -->
+    <?php if(!empty($all_sections) && !$show_promote_mode): ?>
+    <div class="card">
+        <div class="card-header">
+            <h3><i class="bi bi-diagram-3"></i> Sections <span class="hint">(<?= count($all_sections) ?>)</span></h3>
+        </div>
+        <div class="card-body no-padding">
+            <div class="table-scroll">
+                <table class="table-admin">
+                    <thead>
+                        <tr>
+                            <th>Section</th>
+                            <th class="cell-center" style="width:100px">Total</th>
+                            <th class="cell-center" style="width:100px">Male</th>
+                            <th class="cell-center" style="width:100px">Female</th>
+                            <th class="cell-center" style="width:90px">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php foreach($all_sections as $sec): ?>
+                        <tr>
+                            <td class="cell-strong"><?= htmlspecialchars($sec['section']) ?></td>
+                            <td class="cell-center cell-num"><?= (int)$sec['total'] ?></td>
+                            <td class="cell-center cell-male"><?= (int)($sec['boys']??0) ?></td>
+                            <td class="cell-center cell-female"><?= (int)($sec['girls']??0) ?></td>
+                            <td class="cell-center">
+                                <a href="sections_list.php?section=<?= urlencode($sec['section']) ?>"
+                                   class="btn btn-icon btn-outline-primary"
+                                   title="View section">
+                                    <i class="bi bi-arrow-right-short" style="font-size:1.15rem"></i>
+                                </a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- ================= Students ================= -->
+    <div class="card">
+        <div class="card-header">
+            <h3>
+                <i class="bi bi-people"></i> Students
+                <span class="hint">(<?= number_format($total_students) ?>)</span>
+                <?php if ($show_promote_mode): ?>
+                    <span class="tag promotable ms-2"><i class="bi bi-rocket-takeoff"></i> Selection mode</span>
+                <?php endif; ?>
+            </h3>
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+                <?php if ($show_promote_mode): ?>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="selectAll()">
+                        <i class="bi bi-check-all me-1"></i> Select All
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="deselectAll()">
+                        <i class="bi bi-x-circle me-1"></i> Deselect All
+                    </button>
+                    <a href="?school_year=<?= urlencode($school_year) ?>&grade_level=<?= urlencode($grade_level) ?>" class="btn btn-outline-secondary btn-sm">
+                        <i class="bi bi-arrow-left me-1"></i> Exit
+                    </a>
+                <?php endif; ?>
+
+                <?php if ($total_pages > 1): ?>
+                    <div class="pagination ms-md-2">
+                        <a href="<?= $base_url ?>&page=1" class="btn btn-sm <?= $page <= 1 ? 'disabled' : '' ?>" <?= $page <= 1 ? 'tabindex="-1"' : '' ?>>
+                            <i class="bi bi-chevron-double-left"></i>
+                        </a>
+                        <a href="<?= $base_url ?>&page=<?= max(1,$page-1) ?>" class="btn btn-sm <?= $page <= 1 ? 'disabled' : '' ?>" <?= $page <= 1 ? 'tabindex="-1"' : '' ?>>
+                            <i class="bi bi-chevron-left"></i>
+                        </a>
+                        <span class="page-info">Page <?= $page ?> of <?= $total_pages ?></span>
+                        <a href="<?= $base_url ?>&page=<?= min($total_pages,$page+1) ?>" class="btn btn-sm <?= $page >= $total_pages ? 'disabled' : '' ?>" <?= $page >= $total_pages ? 'tabindex="-1"' : '' ?>>
+                            <i class="bi bi-chevron-right"></i>
+                        </a>
+                        <a href="<?= $base_url ?>&page=<?= $total_pages ?>" class="btn btn-sm <?= $page >= $total_pages ? 'disabled' : '' ?>" <?= $page >= $total_pages ? 'tabindex="-1"' : '' ?>>
+                            <i class="bi bi-chevron-double-right"></i>
+                        </a>
+                    </div>
+                <?php endif; ?>
             </div>
         </div>
         <div class="card-body">
             <?php if ($show_promote_mode): ?>
-            <div class="promote-bar" id="promoteBar" style="display:none"><div><span class="selected-count" id="selectedCount">0</span> student(s) selected</div>
-                <div class="d-flex gap-2 align-items-center">
-                    <input type="text" id="promoteNewSY" class="form-control form-control-sm" placeholder="New SY (e.g. <?= htmlspecialchars($next_sy) ?>)" value="<?= htmlspecialchars($next_sy) ?>" style="width:160px">
-                    <button class="btn btn-promote btn-sm" id="promoteSelectedBtn" disabled onclick="submitPromoteSelected()"><i class="bi bi-rocket-takeoff me-1"></i> Promote & Update SY</button>
+            <div class="promote-bar" id="promoteBar" style="display:none">
+                <div>
+                    <div class="selected-count" id="selectedCount">0</div>
+                    <div class="selected-label">student(s) selected for promotion</div>
                 </div>
-                <form method="POST" id="promoteForm"><input type="hidden" name="promote_school_year" value="<?= htmlspecialchars($school_year) ?>"><input type="hidden" name="new_school_year" id="promoteNewSYHidden"><div id="selectedIdsContainer"></div></form>
+                <div class="d-flex gap-2 align-items-center">
+                    <input type="text" id="promoteNewSY" class="form-control form-control-sm"
+                           placeholder="New SY (e.g. <?= htmlspecialchars($next_sy) ?>)"
+                           value="<?= htmlspecialchars($next_sy) ?>" style="width:180px">
+                    <button class="btn btn-promote btn-sm" id="promoteSelectedBtn" disabled onclick="submitPromoteSelected()">
+                        <i class="bi bi-rocket-takeoff me-1"></i> Promote
+                    </button>
+                </div>
+                <form method="POST" id="promoteForm" style="display:none">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8') ?>">
+                    <input type="hidden" name="promote_school_year" value="<?= htmlspecialchars($school_year) ?>">
+                    <input type="hidden" name="new_school_year" id="promoteNewSYHidden">
+                    <div id="selectedIdsContainer"></div>
+                </form>
             </div>
             <?php endif; ?>
 
             <?php if($total_students > 0): ?>
-            <div class="student-grid">
-                <?php foreach($all_students as $s):
-                    $name = htmlspecialchars(formatStudentName($s));
-                    $initials = strtoupper(substr($s['first_name']??'',0,1).substr($s['last_name']??'',0,1));
-                    $st = $s['status'] ?? 'Active';
-                    $isPromotable = ($st === 'Active') && in_array($s['grade_level']??'', ['Grade 11', 'Grade 12']);
-                    $strand_txt = $s['strand'] ?? '';
-                    $strand_init = $strand_txt !== '' ? strandInitials($strand_txt) : '—';
-                ?>
-                <div class="student-card <?= $show_promote_mode && $isPromotable ? 'promotable-card' : '' ?>" data-student-id="<?= $s['student_id'] ?>" data-promotable="<?= $isPromotable ? '1' : '0' ?>">
-                    <?php if ($show_promote_mode && $isPromotable): ?><input type="checkbox" class="select-check student-checkbox" value="<?= $s['student_id'] ?>" onchange="updateSelection()"><?php endif; ?>
-                    <div class="student-avatar"><?= $initials ?></div>
-                    <div class="student-info">
-                        <h4><?= $name ?></h4>
-                        <div class="meta">LRN: <?= htmlspecialchars($s['lrn']??'—') ?> · ID: <?= htmlspecialchars($s['student_id_number']??'—') ?></div>
-                        <div class="tags">
-                            <span class="tag accent"><?= htmlspecialchars($s['grade_level']??'—') ?></span>
-                            <span class="tag"><?= htmlspecialchars($s['section']??'No Section') ?></span>
-                            <span class="tag" title="<?= htmlspecialchars($strand_txt ?: '—') ?>"><?= htmlspecialchars($strand_txt ?: '—') ?></span>
-                            <?php if ($strand_init !== '—'): ?>
-                                <span class="tag initials" title="Strand initials"><?= htmlspecialchars($strand_init) ?></span>
-                            <?php endif; ?>
-                            <?php if ($show_promote_mode && $isPromotable): ?><span class="tag promotable"><i class="bi bi-arrow-up-circle"></i> <?= $s['grade_level']=='Grade 11'?'→ 12':'→ Grad' ?></span><?php endif; ?>
-                            <span class="status-dot <?= $st=='Active'?'success':($st=='Dropped'||$st=='Graduated'?'danger':'warning') ?>"><?= $st ?></span>
+                <div class="student-grid">
+                    <?php foreach($all_students as $s):
+                        $name = htmlspecialchars(formatStudentName($s));
+                        $initials = strtoupper(substr($s['first_name']??'',0,1).substr($s['last_name']??'',0,1));
+                        $st = $s['status'] ?? 'Active';
+                        $isPromotable = ($st === 'Active') && in_array($s['grade_level']??'', ['Grade 11', 'Grade 12']);
+                        $strand_txt = $s['strand'] ?? '';
+                        $strand_init = $strand_txt !== '' ? strandInitials($strand_txt) : '—';
+                        $pillClass = $st === 'Active' ? 'success' : ($st === 'Graduated' ? 'danger' : ($st === 'Dropped' ? 'danger' : 'warning'));
+                    ?>
+                    <div class="student-card" data-student-id="<?= (int)$s['student_id'] ?>" data-promotable="<?= $isPromotable ? '1' : '0' ?>">
+                        <?php if ($show_promote_mode && $isPromotable): ?>
+                            <input type="checkbox" class="select-check student-checkbox" value="<?= (int)$s['student_id'] ?>" onchange="updateSelection()">
+                        <?php endif; ?>
+                        <div class="student-avatar"><?= htmlspecialchars($initials) ?></div>
+                        <div class="student-info">
+                            <h4 title="<?= $name ?>"><?= $name ?></h4>
+                            <div class="meta">
+                                LRN <?= htmlspecialchars($s['lrn']??'—') ?>
+                                <span style="opacity:.5">·</span>
+                                ID <?= htmlspecialchars($s['student_id_number']??'—') ?>
+                            </div>
+                            <div class="tags">
+                                <span class="tag accent"><?= htmlspecialchars($s['grade_level']??'—') ?></span>
+                                <span class="tag"><?= htmlspecialchars($s['section']??'No Section') ?></span>
+                                <?php if ($strand_txt !== ''): ?>
+                                    <span class="tag" title="<?= htmlspecialchars($strand_txt) ?>">
+                                        <?= htmlspecialchars(strlen($strand_txt) > 24 ? substr($strand_txt, 0, 22) . '…' : $strand_txt) ?>
+                                    </span>
+                                    <span class="tag initials" title="Strand initials"><?= htmlspecialchars($strand_init) ?></span>
+                                <?php else: ?>
+                                    <span class="tag">—</span>
+                                <?php endif; ?>
+                                <?php if ($show_promote_mode && $isPromotable): ?>
+                                    <span class="tag promotable">
+                                        <i class="bi bi-arrow-up-circle"></i>
+                                        <?= $s['grade_level']=='Grade 11' ? '→ Grade 12' : '→ Graduate' ?>
+                                    </span>
+                                <?php endif; ?>
+                                <span class="pill <?= $pillClass ?>"><?= htmlspecialchars($st) ?></span>
+                            </div>
+                            <div class="mt-2">
+                                <a href="view_student.php?id=<?= (int)$s['student_id'] ?>" class="btn btn-outline-primary btn-sm">
+                                    <i class="bi bi-eye me-1"></i> View Profile
+                                </a>
+                            </div>
                         </div>
-                        <div class="mt-2"><a href="view_student.php?id=<?= $s['student_id'] ?>" class="btn btn-outline-primary btn-xs"><i class="bi bi-eye me-1"></i> View Profile</a></div>
                     </div>
+                    <?php endforeach; ?>
                 </div>
-                <?php endforeach; ?>
-            </div>
-            <?php if ($total_pages > 1): ?><div class="d-flex justify-content-center mt-4"><div class="pagination"><?php if ($page > 1): ?><a href="<?= $base_url ?>&page=1" class="btn btn-outline-secondary btn-sm"><i class="bi bi-chevron-double-left"></i> First</a><?php endif; ?><?php if ($page > 1): ?><a href="<?= $base_url ?>&page=<?= $page-1 ?>" class="btn btn-outline-secondary btn-sm"><i class="bi bi-chevron-left"></i> Previous</a><?php endif; ?><span class="text-muted small px-3">Page <?= $page ?> of <?= $total_pages ?></span><?php if ($page < $total_pages): ?><a href="<?= $base_url ?>&page=<?= $page+1 ?>" class="btn btn-outline-secondary btn-sm">Next <i class="bi bi-chevron-right"></i></a><?php endif; ?><?php if ($page < $total_pages): ?><a href="<?= $base_url ?>&page=<?= $total_pages ?>" class="btn btn-outline-secondary btn-sm">Last <i class="bi bi-chevron-double-right"></i></a><?php endif; ?></div></div><?php endif; ?>
-            <?php else: ?><div class="text-center py-5 text-muted"><i class="bi bi-people-fill display-4 d-block mb-3"></i>No students found</div><?php endif; ?>
+
+                <?php if ($total_pages > 1): ?>
+                    <div class="d-flex justify-content-center mt-4">
+                        <div class="pagination">
+                            <a href="<?= $base_url ?>&page=1" class="btn btn-sm <?= $page <= 1 ? 'disabled' : '' ?>" <?= $page <= 1 ? 'tabindex="-1"' : '' ?>>
+                                <i class="bi bi-chevron-double-left"></i>
+                            </a>
+                            <a href="<?= $base_url ?>&page=<?= max(1,$page-1) ?>" class="btn btn-sm <?= $page <= 1 ? 'disabled' : '' ?>" <?= $page <= 1 ? 'tabindex="-1"' : '' ?>>
+                                <i class="bi bi-chevron-left"></i> Prev
+                            </a>
+                            <span class="page-info">Page <?= $page ?> of <?= $total_pages ?></span>
+                            <a href="<?= $base_url ?>&page=<?= min($total_pages,$page+1) ?>" class="btn btn-sm <?= $page >= $total_pages ? 'disabled' : '' ?>" <?= $page >= $total_pages ? 'tabindex="-1"' : '' ?>>
+                                Next <i class="bi bi-chevron-right"></i>
+                            </a>
+                            <a href="<?= $base_url ?>&page=<?= $total_pages ?>" class="btn btn-sm <?= $page >= $total_pages ? 'disabled' : '' ?>" <?= $page >= $total_pages ? 'tabindex="-1"' : '' ?>>
+                                <i class="bi bi-chevron-double-right"></i>
+                            </a>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            <?php else: ?>
+                <div class="empty">
+                    <div class="empty-icon"><i class="bi bi-people"></i></div>
+                    <div class="empty-title">No students found</div>
+                    <div class="empty-sub">Try adjusting your filters or search terms.</div>
+                </div>
+            <?php endif; ?>
         </div>
     </div>
 </div>
 
-<div class="modal fade" id="promoteConfirmModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content rounded-4 border-0 shadow"><div class="modal-header" style="background:linear-gradient(135deg,#f59e0b,#d97706);color:#fff"><h6 class="modal-title fw-bold"><i class="bi bi-rocket-takeoff me-2"></i>Promote Students</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body"><input type="hidden" id="promoteActionType"><div class="mb-3"><label class="form-label fw-semibold small">Current School Year</label><input type="text" class="form-control bg-light" id="currentSY" readonly></div><div class="mb-3"><label class="form-label fw-semibold small">New School Year <span class="text-danger">*</span></label><input type="text" class="form-control" id="newSY" placeholder="e.g., 2026-2027" required><div class="form-text">Suggested: <strong id="suggestedSY"></strong></div></div><div class="mb-3"><label class="form-label fw-semibold small">Promotion Details</label><div id="promoteDetails" class="small text-muted"></div></div><div class="alert alert-warning small mb-0"><i class="bi bi-exclamation-triangle me-1"></i> This will promote students AND update their school year.</div></div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-promote btn-sm" id="confirmPromoteBtn"><i class="bi bi-rocket-takeoff me-1"></i> Promote & Update</button></div></div></div></div>
+<!-- ================= Promote modal ================= -->
+<div class="modal fade" id="promoteConfirmModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header promote-head">
+                <h6 class="modal-title fw-bold"><i class="bi bi-rocket-takeoff me-2"></i>Promote Students</h6>
+                <button class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="promoteActionType">
+                <div class="mb-3">
+                    <label class="form-label">Current School Year</label>
+                    <input type="text" class="form-control" id="currentSY" readonly style="background:var(--surface-2)">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">New School Year <span class="text-danger">*</span></label>
+                    <input type="text" class="form-control" id="newSY" placeholder="e.g., 2026-2027" required>
+                    <div class="form-text mt-1">Suggested: <strong id="suggestedSY"></strong></div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Promotion Details</label>
+                    <div id="promoteDetails" class="small" style="color:var(--text-2)"></div>
+                </div>
+                <div class="flash warning mb-0" style="background:var(--amber-soft);color:var(--amber);border-color:color-mix(in srgb, var(--amber) 25%, transparent)">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    <span>This will promote students AND update their school year. Cannot be undone.</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <button class="btn btn-promote btn-sm" id="confirmPromoteBtn">
+                    <i class="bi bi-rocket-takeoff me-1"></i> Promote &amp; Update
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
 
-<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
+<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(2px);z-index:199"
+     onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-const sb=document.getElementById('sidebar'),ov=document.getElementById('sidebarOverlay');
-document.getElementById('menuToggle').addEventListener('click',()=>{sb.classList.toggle('open');ov.style.display=sb.classList.contains('open')?'block':'none'});
-const tb=document.getElementById('themeToggle'),ti=document.getElementById('themeIcon'),h=document.documentElement;
-function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
-(function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
+// ---------- Sidebar ----------
+const sb = document.getElementById('sidebar');
+const ov = document.getElementById('sidebarOverlay');
+document.getElementById('menuToggle').addEventListener('click', () => {
+    sb.classList.toggle('open');
+    ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
+});
 
-function showPromoteModal(type){const sy='<?= addslashes($school_year) ?>',g11=<?= $promote_preview_11 ?>,g12=<?= $promote_preview_12 ?>;document.getElementById('currentSY').value=sy;document.getElementById('promoteActionType').value=type;const p=sy.split('-');if(p.length===2){const ns=(parseInt(p[0])+1)+'-'+(parseInt(p[1])+1);document.getElementById('suggestedSY').textContent=ns;document.getElementById('newSY').value=ns}let d='';if(type==='grade11')d=`<strong>${g11}</strong> Grade 11 → Grade 12`;else if(type==='grade12')d=`<strong>${g12}</strong> Grade 12 → Graduated`;else{if(g11>0)d+=`<strong>${g11}</strong> Grade 11 → Grade 12<br>`;if(g12>0)d+=`<strong>${g12}</strong> Grade 12 → Graduated`}document.getElementById('promoteDetails').innerHTML=d;new bootstrap.Modal(document.getElementById('promoteConfirmModal')).show()}
-document.getElementById('confirmPromoteBtn').addEventListener('click',function(){const t=document.getElementById('promoteActionType').value,o=document.getElementById('currentSY').value,n=document.getElementById('newSY').value.trim();if(!n){alert('Please enter the new school year.');return}if(n===o){alert('New school year must be different.');return}window.location.href=`student_profile.php?promote_students=1&school_year=${encodeURIComponent(o)}&promote_type=${t}&new_school_year=${encodeURIComponent(n)}`});
+// ---------- Theme ----------
+const tb = document.getElementById('themeToggle');
+const ti = document.getElementById('themeIcon');
+const h  = document.documentElement;
+function st(t) {
+    h.setAttribute('data-bs-theme', t);
+    ti.className = 'bi bi-' + (t === 'dark' ? 'sun-fill' : 'moon-stars-fill');
+    document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + (60*60*24*365);
+}
+(function () {
+    const m = document.cookie.match(/admin_theme=([^;]+)/);
+    st(m ? m[1] : 'light');
+})();
+tb.addEventListener('click', () => st(h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'));
 
-function updateSelection(){const c=document.querySelectorAll('.student-checkbox:checked'),n=c.length,b=document.getElementById('promoteBar'),t=document.getElementById('promoteSelectedBtn'),l=document.getElementById('selectedCount'),p=document.getElementById('selectedIdsContainer');if(b)b.style.display=n>0?'flex':'none';if(l)l.textContent=n;if(t)t.disabled=n===0;if(p){p.innerHTML='';c.forEach(cb=>{const i=document.createElement('input');i.type='hidden';i.name='selected_students[]';i.value=cb.value;p.appendChild(i)})}document.querySelectorAll('.student-checkbox').forEach(cb=>{const cd=cb.closest('.student-card');if(cd)cd.classList.toggle('selected',cb.checked)})}
-function selectAll(){document.querySelectorAll('.student-checkbox').forEach(cb=>{cb.checked=true});updateSelection()}
-function deselectAll(){document.querySelectorAll('.student-checkbox').forEach(cb=>{cb.checked=false});updateSelection()}
-function submitPromoteSelected(){const n=document.querySelectorAll('.student-checkbox:checked').length;if(n===0){alert('No students selected.');return}const nsy=document.getElementById('promoteNewSY').value.trim();if(!nsy){alert('Please enter the new school year.');return}document.getElementById('promoteNewSYHidden').value=nsy;if(confirm(`Promote ${n} selected student(s) to new SY ${nsy}?\n\n⚠️ Cannot undo.`))document.getElementById('promoteForm').submit()}
-document.addEventListener('DOMContentLoaded',updateSelection);
+// ---------- Promote modal ----------
+function showPromoteModal(type) {
+    const sy = '<?= addslashes($school_year) ?>';
+    const g11 = <?= $promote_preview_11 ?>;
+    const g12 = <?= $promote_preview_12 ?>;
+
+    document.getElementById('currentSY').value = sy;
+    document.getElementById('promoteActionType').value = type;
+
+    const p = sy.split('-');
+    if (p.length === 2) {
+        const ns = (parseInt(p[0]) + 1) + '-' + (parseInt(p[1]) + 1);
+        document.getElementById('suggestedSY').textContent = ns;
+        document.getElementById('newSY').value = ns;
+    }
+
+    let d = '';
+    if (type === 'grade11') d = `<strong>${g11}</strong> Grade 11 → Grade 12`;
+    else if (type === 'grade12') d = `<strong>${g12}</strong> Grade 12 → Graduated`;
+    else {
+        if (g11 > 0) d += `<strong>${g11}</strong> Grade 11 → Grade 12<br>`;
+        if (g12 > 0) d += `<strong>${g12}</strong> Grade 12 → Graduated`;
+    }
+    document.getElementById('promoteDetails').innerHTML = d;
+
+    new bootstrap.Modal(document.getElementById('promoteConfirmModal')).show();
+}
+
+document.getElementById('confirmPromoteBtn').addEventListener('click', function () {
+    const t = document.getElementById('promoteActionType').value;
+    const o = document.getElementById('currentSY').value;
+    const n = document.getElementById('newSY').value.trim();
+    if (!n) { alert('Please enter the new school year.'); return; }
+    if (n === o) { alert('New school year must be different.'); return; }
+    window.location.href = `student_profile.php?promote_students=1&school_year=${encodeURIComponent(o)}&promote_type=${t}&new_school_year=${encodeURIComponent(n)}`;
+});
+
+// ---------- Selection ----------
+function updateSelection() {
+    const c = document.querySelectorAll('.student-checkbox:checked');
+    const n = c.length;
+    const b = document.getElementById('promoteBar');
+    const t = document.getElementById('promoteSelectedBtn');
+    const l = document.getElementById('selectedCount');
+    const p = document.getElementById('selectedIdsContainer');
+
+    if (b) b.style.display = n > 0 ? 'flex' : 'none';
+    if (l) l.textContent = n;
+    if (t) t.disabled = n === 0;
+    if (p) {
+        p.innerHTML = '';
+        c.forEach(cb => {
+            const i = document.createElement('input');
+            i.type = 'hidden';
+            i.name = 'selected_students[]';
+            i.value = cb.value;
+            p.appendChild(i);
+        });
+    }
+    document.querySelectorAll('.student-checkbox').forEach(cb => {
+        const cd = cb.closest('.student-card');
+        if (cd) cd.classList.toggle('selected', cb.checked);
+    });
+}
+
+function selectAll() {
+    document.querySelectorAll('.student-checkbox').forEach(cb => { cb.checked = true; });
+    updateSelection();
+}
+
+function deselectAll() {
+    document.querySelectorAll('.student-checkbox').forEach(cb => { cb.checked = false; });
+    updateSelection();
+}
+
+function submitPromoteSelected() {
+    const n = document.querySelectorAll('.student-checkbox:checked').length;
+    if (n === 0) { alert('No students selected.'); return; }
+    const nsy = document.getElementById('promoteNewSY').value.trim();
+    if (!nsy) { alert('Please enter the new school year.'); return; }
+    document.getElementById('promoteNewSYHidden').value = nsy;
+    if (confirm(`Promote ${n} selected student(s) to new SY ${nsy}?\n\n⚠️ This cannot be undone.`)) {
+        document.getElementById('promoteForm').submit();
+    }
+}
+
+document.addEventListener('DOMContentLoaded', updateSelection);
 </script>
 </body>
 </html>

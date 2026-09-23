@@ -1,11 +1,5 @@
 <?php
-session_start();
-include "../config/db.php";
-
-if (!isset($_SESSION['admin_id'])) {
-    header("Location: admin_login.php");
-    exit();
-}
+require_once __DIR__ . '/../config/auth.php';
 
 // Check if we are exporting to Word
 $export_word = isset($_GET['export_word']) && $_GET['export_word'] == 1;
