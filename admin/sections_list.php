@@ -89,9 +89,19 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sections • USAT Admin</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
+
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+    <!-- Bootstrap Icons — served from cdnjs because CSP font-src allows it -->
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+
     <style>
         :root {
             --bg: #f1f5f9; --surface: #ffffff; --text: #1a1f36; --text2: #6b7280;
@@ -105,8 +115,12 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
             --border: #334155; --accent: #818cf8; --accent2: #6366f1;
             --shadow: 0 1px 3px rgba(0,0,0,0.3); --shadow-lg: 0 10px 25px rgba(0,0,0,0.5);
         }
-        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
-        body{background:var(--bg);color:var(--text);min-height:100vh}
+
+        *{margin:0;padding:0;box-sizing:border-box}
+        body{
+            font-family:'Inter',system-ui,sans-serif;
+            background:var(--bg);color:var(--text);min-height:100vh;
+        }
         
         .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
         .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
@@ -155,7 +169,7 @@ $theme = isset($_COOKIE['admin_theme']) && $_COOKIE['admin_theme'] === 'dark' ? 
     <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
     <nav class="sidebar-nav">
         <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
-        <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
+        <a href="student_profile.php" class="active"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
         <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
     </nav>
@@ -260,7 +274,7 @@ const sb=document.getElementById('sidebar'),ov=document.getElementById('sidebarO
 document.getElementById('menuToggle').addEventListener('click',()=>{sb.classList.toggle('open');ov.style.display=sb.classList.contains('open')?'block':'none'});
 const tb=document.getElementById('themeToggle'),ti=document.getElementById('themeIcon'),h=document.documentElement;
 function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
-(function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();
+(function(){const m=document.cookie.match(/(?:^|; )admin_theme=([^;]+)/);st(m?decodeURIComponent(m[1]):'light')})();
 tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
 </script>
 </body>

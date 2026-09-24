@@ -116,9 +116,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!empty($errors)) throw new Exception("Please correct the errors below.");
 
         // Update students_info
-        // FIXED: type string correctly matches values
-        //   position 12 = 's' for religion
-        //   position 14 = 'd' for weight
         $stmt = $conn->prepare("UPDATE students_info SET lrn=?,first_name=?,middle_name=?,last_name=?,nick_name=?,ext_name=?,sex=?,birth_date=?,age=?,civil_status=?,nationality=?,religion=?,height=?,weight=?,email=?,phone=?,special_skills=? WHERE student_id=?");
         $stmt->bind_param("ssssssssisssddsssi",
             $lrn,
@@ -214,7 +211,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         // ---- Audit the student_info update with a diff ----
-        audit_diff($conn, 'student.update', [
+        // Guarded: if audit_diff is missing (older audit.php), fall back to a
+        // plain audit_log entry so the save still succeeds.
+        $old_snapshot = [
             'lrn'            => $student['lrn']            ?? null,
             'first_name'     => $student['first_name']     ?? null,
             'middle_name'    => $student['middle_name']    ?? null,
@@ -232,7 +231,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'email'          => $student['email']          ?? null,
             'phone'          => $student['phone']          ?? null,
             'special_skills' => $student['special_skills'] ?? null,
-        ], [
+        ];
+        $new_snapshot = [
             'lrn'            => $lrn,
             'first_name'     => $first_name,
             'middle_name'    => $middle_name ?: null,
@@ -250,7 +250,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'email'          => $email ?: null,
             'phone'          => $phone ?: null,
             'special_skills' => $special_skills ?: null,
-        ], 'student', $student_id);
+        ];
+
+        try {
+            if (function_exists('audit_diff')) {
+                audit_diff($conn, 'student.update', $old_snapshot, $new_snapshot, 'student', $student_id);
+            } elseif (function_exists('audit_log')) {
+                audit_log($conn, 'student.update', ['type' => 'student', 'id' => $student_id]);
+            }
+        } catch (Throwable $auditErr) {
+            // Never let an audit failure block the save
+            error_log('edit_student: audit failed: ' . $auditErr->getMessage());
+        }
 
         $conn->commit();
         $_SESSION['success'] = "Student record updated!";
@@ -272,97 +283,386 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Edit Student • USAT Admin</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet">
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+
     <style>
+        /* ============================================================
+           Design tokens (matched to the rest of the app)
+           ============================================================ */
         :root {
-            --bg: #f1f5f9; --surface: #ffffff; --text: #1a1f36; --text2: #6b7280;
-            --border: #e5e7eb; --accent: #4f46e5; --accent2: #6366f1;
-            --green: #059669; --red: #dc2626; --amber: #d97706;
-            --shadow: 0 1px 3px rgba(0,0,0,0.06); --shadow-lg: 0 10px 25px rgba(0,0,0,0.08);
-            --radius: 12px; --radius-lg: 16px;
+            --bg: #f4f6fb;
+            --surface: #ffffff;
+            --surface-2: #f8fafc;
+            --text: #0f172a;
+            --text-2: #64748b;
+            --text-3: #94a3b8;
+            --border: #e5e7eb;
+            --border-strong: #d1d5db;
+            --accent: #4f46e5;
+            --accent-2: #6366f1;
+            --accent-soft: #eef2ff;
+            --green: #059669;
+            --green-soft: #d1fae5;
+            --red: #dc2626;
+            --red-soft: #fee2e2;
+            --amber: #d97706;
+            --amber-soft: #fef3c7;
+            --purple: #7c3aed;
+            --purple-soft: #ede9fe;
+            --blue: #2563eb;
+            --blue-soft: #dbeafe;
+
+            --shadow-xs: 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-sm: 0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04);
+            --shadow-md: 0 4px 12px rgba(15,23,42,0.06);
+            --shadow-lg: 0 12px 32px rgba(15,23,42,0.10);
+
+            --radius-sm: 8px;
+            --radius: 12px;
+            --radius-lg: 16px;
+
+            --sidebar-w: 264px;
         }
+
         [data-bs-theme="dark"] {
-            --bg: #0f172a; --surface: #1e293b; --text: #f1f5f9; --text2: #94a3b8;
-            --border: #334155; --accent: #818cf8; --accent2: #6366f1;
-            --shadow: 0 1px 3px rgba(0,0,0,0.3); --shadow-lg: 0 10px 25px rgba(0,0,0,0.5);
+            --bg: #0b1220;
+            --surface: #131c2e;
+            --surface-2: #1a2439;
+            --text: #f1f5f9;
+            --text-2: #94a3b8;
+            --text-3: #64748b;
+            --border: #1f2a44;
+            --border-strong: #2d3b57;
+            --accent: #818cf8;
+            --accent-2: #6366f1;
+            --accent-soft: #1e2140;
+            --green-soft: #052e24;
+            --red-soft: #3f1517;
+            --amber-soft: #3d2a08;
+            --purple-soft: #2e1a54;
+            --blue-soft: #1e3a5f;
+
+            --shadow-xs: 0 1px 2px rgba(0,0,0,0.3);
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.35);
+            --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+            --shadow-lg: 0 12px 32px rgba(0,0,0,0.55);
         }
-        *{font-family:'Inter',system-ui,sans-serif;margin:0;padding:0;box-sizing:border-box}
-        body{background:var(--bg);color:var(--text);min-height:100vh}
 
-        .sidebar{position:fixed;left:0;top:0;bottom:0;width:260px;background:var(--surface);border-right:1px solid var(--border);z-index:200;display:flex;flex-direction:column;transition:transform 0.3s}
-        .sidebar-brand{padding:1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
-        .sidebar-brand img{width:40px;height:40px;border-radius:10px}
-        .sidebar-brand span{font-weight:700;font-size:1.1rem}
-        .sidebar-nav{flex:1;padding:1rem 0.75rem;overflow-y:auto}
-        .sidebar-nav a{display:flex;align-items:center;gap:0.75rem;padding:0.7rem 1rem;border-radius:10px;color:var(--text2);text-decoration:none;font-weight:500;font-size:0.9rem;transition:all 0.2s;margin-bottom:0.25rem}
-        .sidebar-nav a:hover,.sidebar-nav a.active{background:var(--accent);color:white}
-        .sidebar-nav a i{font-size:1.2rem;width:24px;text-align:center}
-        .sidebar-footer{padding:1rem 0.75rem;border-top:1px solid var(--border)}
+        *{font-family:'Inter',system-ui,-apple-system,sans-serif;margin:0;padding:0;box-sizing:border-box}
+        html,body{height:100%}
+        body{background:var(--bg);color:var(--text);min-height:100vh;-webkit-font-smoothing:antialiased}
 
-        .main-content{margin-left:260px;padding:1.5rem;min-height:100vh}
-        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.5rem;flex-wrap:wrap;gap:1rem}
-        .menu-toggle{display:none;width:40px;height:40px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;align-items:center;justify-content:center}
+        /* ============================================================
+           Sidebar
+           ============================================================ */
+        .sidebar{
+            position:fixed;left:0;top:0;bottom:0;width:var(--sidebar-w);
+            background:var(--surface);border-right:1px solid var(--border);
+            z-index:200;display:flex;flex-direction:column;
+            transition:transform .28s cubic-bezier(.4,0,.2,1);
+        }
+        .sidebar-brand{
+            padding:1.25rem 1.5rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;gap:.75rem;
+        }
+        .sidebar-brand img{
+            width:38px;height:38px;border-radius:10px;object-fit:cover;
+            box-shadow:0 0 0 3px var(--accent-soft);
+        }
+        .sidebar-brand .brand-text{display:flex;flex-direction:column;line-height:1.15}
+        .sidebar-brand .brand-name{font-weight:700;font-size:.95rem;color:var(--text)}
+        .sidebar-brand .brand-sub{font-size:.68rem;color:var(--text-2);text-transform:uppercase;letter-spacing:.6px;font-weight:600}
 
-        .card{background:var(--surface);border-radius:var(--radius-lg);border:1px solid var(--border);box-shadow:var(--shadow);margin-bottom:1.25rem;overflow:hidden}
-        .card-header{padding:1rem 1.5rem;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:0.75rem}
-        .card-header h3{margin:0;font-size:0.95rem;font-weight:600}
-        .card-header i{color:var(--accent);font-size:1.2rem}
-        .card-body{padding:1.5rem}
+        .sidebar-nav{flex:1;padding:.75rem .75rem 1rem;overflow-y:auto}
+        .sidebar-nav .nav-label{
+            font-size:.65rem;font-weight:700;color:var(--text-3);
+            text-transform:uppercase;letter-spacing:.8px;
+            padding:.75rem .75rem .35rem;
+        }
+        .sidebar-nav a{
+            display:flex;align-items:center;gap:.75rem;
+            padding:.6rem .75rem;border-radius:10px;
+            color:var(--text-2);text-decoration:none;
+            font-weight:500;font-size:.875rem;
+            transition:background .15s, color .15s;
+            margin-bottom:.1rem;
+        }
+        .sidebar-nav a:hover{background:var(--surface-2);color:var(--text)}
+        .sidebar-nav a.active{background:var(--accent);color:#fff;box-shadow:0 4px 12px -4px rgba(79,70,229,.5)}
+        .sidebar-nav a.active:hover{background:var(--accent)}
+        .sidebar-nav a i{font-size:1.05rem;width:20px;text-align:center;flex-shrink:0}
+        .sidebar-footer{padding:.75rem;border-top:1px solid var(--border)}
 
-        .form-label{font-size:0.8rem;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:0.35rem}
+        /* ============================================================
+           Main content
+           ============================================================ */
+        .main-content{
+            margin-left:var(--sidebar-w);
+            padding:1.5rem clamp(1rem,2.5vw,2rem) 2rem;
+            min-height:100vh;
+            max-width:1400px;
+        }
+        .topbar{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:1.5rem;gap:1rem;flex-wrap:wrap;
+        }
+        .topbar h2{font-size:1.35rem;font-weight:700;letter-spacing:-.02em;margin:0}
+        .topbar .sub{font-size:.85rem;color:var(--text-2);margin:.15rem 0 0}
+        .menu-toggle{
+            display:none;width:40px;height:40px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text);cursor:pointer;
+            align-items:center;justify-content:center;
+            transition:background .15s;
+        }
+        .menu-toggle:hover{background:var(--surface-2)}
+
+        /* ============================================================
+           Cards
+           ============================================================ */
+        .card{
+            background:var(--surface);border-radius:var(--radius-lg);
+            border:1px solid var(--border);box-shadow:var(--shadow-sm);
+            margin-bottom:1.25rem;overflow:hidden;
+        }
+        .card-header{
+            padding:.9rem 1.25rem;border-bottom:1px solid var(--border);
+            display:flex;align-items:center;justify-content:space-between;
+            gap:.75rem;flex-wrap:wrap;background:var(--surface);
+        }
+        .card-header .head-left{
+            display:flex;align-items:center;gap:.6rem;
+        }
+        .card-header .head-icon{
+            width:32px;height:32px;border-radius:9px;
+            background:var(--accent-soft);color:var(--accent);
+            display:flex;align-items:center;justify-content:center;
+            font-size:.95rem;flex-shrink:0;
+        }
+        .card-header h3{
+            margin:0;font-size:.9rem;font-weight:600;color:var(--text);
+        }
+        .card-body{padding:1.25rem}
+
+        /* ============================================================
+           Form fields
+           ============================================================ */
+        .form-label{
+            display:block;
+            font-size:.7rem;font-weight:700;color:var(--text-2);
+            text-transform:uppercase;letter-spacing:.5px;
+            margin-bottom:.35rem;
+        }
         .form-label.required::after{content:" *";color:var(--red)}
-        .form-control,.form-select{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:0.65rem 1rem;font-size:0.9rem;color:var(--text);transition:all 0.2s}
-        .form-control:focus,.form-select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,0.15);outline:none}
+        .form-control,.form-select{
+            background:var(--surface-2);border:1px solid var(--border);
+            border-radius:10px;padding:.55rem .8rem;font-size:.875rem;
+            color:var(--text);font-family:inherit;width:100%;
+            transition:border-color .15s, box-shadow .15s, background .15s;
+        }
+        .form-control::placeholder{color:var(--text-3)}
+        .form-control:focus,.form-select:focus{
+            border-color:var(--accent);background:var(--surface);
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+            outline:none;
+        }
+        .form-control[readonly],.form-control.bg-light{
+            background:var(--surface) !important;
+            color:var(--text-2);
+            cursor:not-allowed;
+            border-style:dashed;
+        }
+        .form-control.is-invalid{border-color:var(--red)}
+        .form-control.is-invalid:focus{
+            box-shadow:0 0 0 3px color-mix(in srgb, var(--red) 18%, transparent);
+        }
 
-        .edu-block{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:1.25rem;margin-bottom:1rem}
+        /* ============================================================
+           Education block
+           ============================================================ */
+        .edu-block{
+            background:var(--surface-2);
+            border:1px solid var(--border);
+            border-radius:var(--radius);
+            padding:1.1rem;
+            margin-bottom:.85rem;
+            position:relative;
+        }
+        .edu-block:last-child{margin-bottom:0}
+        .edu-block-head{
+            display:flex;align-items:center;justify-content:space-between;
+            margin-bottom:.85rem;gap:.5rem;
+        }
+        .edu-block-title{
+            font-size:.82rem;font-weight:700;color:var(--accent);
+            display:flex;align-items:center;gap:.4rem;
+        }
 
-        .theme-btn{width:38px;height:38px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);cursor:pointer;display:flex;align-items:center;justify-content:center}
-        .theme-btn:hover{background:var(--accent);color:white;border-color:var(--accent)}
-        .btn{font-weight:500;border-radius:8px}
+        /* ============================================================
+           Buttons
+           ============================================================ */
+        .btn{font-weight:500;border-radius:9px;font-size:.82rem;transition:all .15s}
+        .btn-primary{background:var(--accent);border-color:var(--accent)}
+        .btn-primary:hover{background:var(--accent-2);border-color:var(--accent-2)}
+        .btn-outline-secondary{color:var(--text-2);border-color:var(--border)}
+        .btn-outline-secondary:hover{background:var(--surface-2);color:var(--text);border-color:var(--border-strong)}
+        .btn-outline-danger{color:var(--red);border-color:color-mix(in srgb, var(--red) 35%, transparent)}
+        .btn-outline-danger:hover{background:var(--red);color:#fff;border-color:var(--red)}
+        .btn-xs{padding:.25rem .55rem;font-size:.72rem;border-radius:8px}
+        .btn-lg{
+            padding:.75rem 1.5rem;
+            font-size:.9rem;
+        }
+        .theme-btn{
+            width:38px;height:38px;border-radius:10px;
+            border:1px solid var(--border);background:var(--surface);
+            color:var(--text-2);cursor:pointer;
+            display:flex;align-items:center;justify-content:center;
+            transition:all .15s;
+        }
+        .theme-btn:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
 
-        .badge-pill{display:inline-flex;align-items:center;gap:0.3rem;padding:0.25rem 0.7rem;border-radius:50px;font-size:0.72rem;font-weight:600}
-        .badge-pill.success{background:#d1fae5;color:#065f46}.badge-pill.warning{background:#fef3c7;color:#92400e}.badge-pill.danger{background:#fee2e2;color:#991b1b}.badge-pill.info{background:#dbeafe;color:#1e40af}
-        [data-bs-theme="dark"] .badge-pill.success{background:#064e3b;color:#6ee7b7}[data-bs-theme="dark"] .badge-pill.warning{background:#78350f;color:#fcd34d}[data-bs-theme="dark"] .badge-pill.danger{background:#7f1d1d;color:#fca5a5}[data-bs-theme="dark"] .badge-pill.info{background:#1e3a5f;color:#93c5fd}
+        /* ============================================================
+           Pills
+           ============================================================ */
+        .pill{
+            display:inline-flex;align-items:center;gap:.35rem;
+            padding:.22rem .65rem;border-radius:999px;
+            font-size:.72rem;font-weight:600;
+            border:1px solid transparent;
+        }
+        .pill.success{background:var(--green-soft);color:var(--green);border-color:color-mix(in srgb, var(--green) 22%, transparent)}
+        .pill.warning{background:var(--amber-soft);color:var(--amber);border-color:color-mix(in srgb, var(--amber) 22%, transparent)}
+        .pill.danger {background:var(--red-soft);  color:var(--red);  border-color:color-mix(in srgb, var(--red) 22%, transparent)}
 
-        @media(max-width:1024px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main-content{margin-left:0}.menu-toggle{display:flex}}
-        @media(max-width:640px){.main-content{padding:1rem}}
+        /* ============================================================
+           Flash alerts
+           ============================================================ */
+        .flash{
+            display:flex;align-items:center;gap:.65rem;
+            padding:.75rem 1rem;border-radius:var(--radius);
+            margin-bottom:1rem;font-size:.88rem;font-weight:500;
+            border:1px solid transparent;
+        }
+        .flash.error{background:var(--red-soft);color:var(--red);border-color:color-mix(in srgb, var(--red) 25%, transparent)}
+        .flash .btn-close{margin-left:auto;opacity:.6}
+
+        /* ============================================================
+           Sticky footer action bar
+           ============================================================ */
+        .action-bar{
+            position:sticky;bottom:0;
+            display:flex;justify-content:flex-end;gap:.75rem;
+            padding:1rem 0 0;
+            margin-top:.5rem;
+            background:linear-gradient(to top, var(--bg) 60%, transparent);
+        }
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width:1024px){
+            .sidebar{transform:translateX(-100%)}
+            .sidebar.open{transform:translateX(0)}
+            .main-content{margin-left:0}
+            .menu-toggle{display:flex}
+        }
+        @media (max-width:640px){
+            .main-content{padding:1rem}
+            .card-body{padding:1rem}
+            .card-header{padding:.75rem 1rem}
+            .action-bar{
+                flex-direction:column-reverse;
+                position:static;
+                background:none;
+            }
+            .action-bar .btn{width:100%}
+        }
     </style>
 </head>
 <body>
 
+<!-- ================= Sidebar ================= -->
 <aside class="sidebar" id="sidebar">
-    <div class="sidebar-brand"><img src="../assets/img/usat.jpg" alt="USAT"><span>USAT Admin</span></div>
+    <div class="sidebar-brand">
+        <img src="../assets/img/usat.jpg" alt="USAT" onerror="this.style.background='var(--accent)'">
+        <div class="brand-text">
+            <span class="brand-name">USAT Admin</span>
+            <span class="brand-sub">Enrollment System</span>
+        </div>
+    </div>
     <nav class="sidebar-nav">
+        <div class="nav-label">Overview</div>
         <a href="dashboard.php"><i class="bi bi-speedometer2"></i> Dashboard</a>
-        <a href="student_profile.php"><i class="bi bi-people-fill"></i> Students</a>
+        <a href="student_profile.php" class="active"><i class="bi bi-people-fill"></i> Students</a>
         <a href="reports.php"><i class="bi bi-file-earmark-bar-graph"></i> Reports</a>
+        <div class="nav-label" style="margin-top:.5rem">Administration</div>
         <a href="create_account.php"><i class="bi bi-person-plus"></i> Accounts</a>
+        <?php if (($_SESSION['admin_role'] ?? '') === 'superadmin'): ?>
+            <a href="audit_log.php"><i class="bi bi-shield-check"></i> Audit Log</a>
+        <?php endif; ?>
     </nav>
-    <div class="sidebar-footer"><a href="logout.php" class="btn btn-outline-danger btn-sm w-100"><i class="bi bi-box-arrow-right me-1"></i> Logout</a></div>
+    <div class="sidebar-footer">
+        <a href="logout.php" class="btn btn-outline-danger btn-sm w-100">
+            <i class="bi bi-box-arrow-right me-1"></i> Logout
+        </a>
+    </div>
 </aside>
 
 <div class="main-content" id="mainContent">
-    <?php if(!empty($errors['general'])): ?><div class="alert alert-danger alert-dismissible fade show d-flex align-items-center gap-2 mb-3 rounded-3 border-0 shadow-sm"><i class="bi bi-exclamation-triangle-fill fs-5"></i> <?= htmlspecialchars($errors['general']) ?><button class="btn-close" data-bs-dismiss="alert"></button></div><?php endif; ?>
 
+    <!-- ================= Flash alerts ================= -->
+    <?php if(!empty($errors['general'])): ?>
+        <div class="flash error">
+            <i class="bi bi-exclamation-triangle-fill"></i>
+            <span><?= htmlspecialchars($errors['general']) ?></span>
+            <button class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+    <?php endif; ?>
+
+    <!-- ================= Topbar ================= -->
     <div class="topbar">
         <div class="d-flex align-items-center gap-3">
             <button class="menu-toggle" id="menuToggle"><i class="bi bi-list fs-5"></i></button>
-            <div><h2 style="font-size:1.4rem;font-weight:700;margin:0">Edit Student</h2><p class="text-muted small mb-0"><?= htmlspecialchars($student['first_name'].' '.$student['last_name']) ?> · <span class="badge-pill <?= strtolower($student['status']??'Active')=='active'?'success':(strtolower($student['status']??'')=='dropped'?'danger':'warning') ?>"><?= $student['status']??'Active' ?></span></p></div>
+            <div>
+                <h2>Edit Student</h2>
+                <p class="sub">
+                    <?= htmlspecialchars($student['first_name'].' '.$student['last_name']) ?>
+                    <span class="pill <?= strtolower($student['status']??'Active')=='active' ? 'success' : (strtolower($student['status']??'') == 'dropped' ? 'danger' : 'warning') ?>" style="margin-left:.4rem">
+                        <?= htmlspecialchars($student['status'] ?? 'Active') ?>
+                    </span>
+                </p>
+            </div>
         </div>
         <div class="d-flex gap-2">
-            <a href="view_student.php?id=<?= $student_id ?>" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left me-1"></i> Back</a>
-            <button class="theme-btn" id="themeToggle"><i class="bi bi-moon-stars-fill" id="themeIcon"></i></button>
+            <a href="view_student.php?id=<?= $student_id ?>" class="btn btn-outline-secondary btn-sm">
+                <i class="bi bi-arrow-left me-1"></i> Back
+            </a>
+            <button class="theme-btn" id="themeToggle" title="Toggle theme">
+                <i class="bi bi-moon-stars-fill" id="themeIcon"></i>
+            </button>
         </div>
     </div>
 
     <form method="POST" id="editForm">
         <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8') ?>">
 
-        <!-- Basic Info -->
+        <!-- ================= Basic Info ================= -->
         <div class="card">
-            <div class="card-header"><i class="bi bi-person-vcard"></i><h3>Basic Information</h3></div>
+            <div class="card-header">
+                <div class="head-left">
+                    <div class="head-icon"><i class="bi bi-person-vcard"></i></div>
+                    <h3>Basic Information</h3>
+                </div>
+            </div>
             <div class="card-body">
                 <div class="row g-3">
                     <div class="col-md-3"><label class="form-label">LRN</label><input type="text" name="lrn" class="form-control" value="<?= htmlspecialchars($old['lrn']??'') ?>"></div>
@@ -377,7 +677,6 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
                     <div class="col-md-4"><label class="form-label">Civil Status</label><select name="civil_status" class="form-select"><option value="">Select</option><option value="Single" <?= ($old['civil_status']??'')=='Single'?'selected':'' ?>>Single</option><option value="Married" <?= ($old['civil_status']??'')=='Married'?'selected':'' ?>>Married</option></select></div>
                     <div class="col-md-4"><label class="form-label">Nationality</label><input type="text" name="nationality" class="form-control" value="<?= htmlspecialchars($old['nationality']??'Filipino') ?>"></div>
 
-                    <!-- Religion — real dropdown + "Other" text input -->
                     <div class="col-md-4">
                         <label class="form-label">Religion</label>
                         <select id="religion_select" class="form-select" onchange="syncReligion()">
@@ -407,9 +706,14 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
             </div>
         </div>
 
-        <!-- Parents -->
+        <!-- ================= Parents ================= -->
         <div class="card">
-            <div class="card-header"><i class="bi bi-people"></i><h3>Parents & Guardian</h3></div>
+            <div class="card-header">
+                <div class="head-left">
+                    <div class="head-icon"><i class="bi bi-people"></i></div>
+                    <h3>Parents &amp; Guardian</h3>
+                </div>
+            </div>
             <div class="card-body">
                 <div class="row g-3">
                     <div class="col-md-4"><label class="form-label">Father Name</label><input type="text" name="father_name" class="form-control" value="<?= htmlspecialchars($old['father_name']??'') ?>"></div>
@@ -419,7 +723,13 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
                     <div class="col-md-4"><label class="form-label">Mother Occupation</label><input type="text" name="mother_occupation" class="form-control" value="<?= htmlspecialchars($old['mother_occupation']??'') ?>"></div>
                     <div class="col-md-4"><label class="form-label">Mother Contact</label><input type="tel" name="mother_contact" class="form-control" value="<?= htmlspecialchars($old['mother_contact']??'') ?>"></div>
                     <div class="col-md-4"><label class="form-label">Family Income (₱)</label><input type="number" step="0.01" name="ave_family_income" class="form-control" value="<?= htmlspecialchars($old['ave_family_income']??'') ?>"></div>
-                    <div class="col-12"><hr><h6 class="fw-bold mb-3"><i class="bi bi-shield-check me-2"></i>Guardian</h6></div>
+
+                    <div class="col-12">
+                        <hr style="border-color:var(--border);margin:.5rem 0 .75rem">
+                        <h6 style="font-size:.78rem;font-weight:700;color:var(--text-2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:.75rem">
+                            <i class="bi bi-shield-check me-1" style="color:var(--accent)"></i> Guardian
+                        </h6>
+                    </div>
                     <div class="col-md-4"><label class="form-label">Guardian Name</label><input type="text" name="guardian_fullname" class="form-control" value="<?= htmlspecialchars($old['guardian_fullname']??'') ?>"></div>
                     <div class="col-md-4"><label class="form-label">Relationship</label><input type="text" name="guardian_relation" class="form-control" value="<?= htmlspecialchars($old['guardian_relation']??'') ?>"></div>
                     <div class="col-md-4"><label class="form-label">Guardian Contact</label><input type="tel" name="guardian_contact" class="form-control" value="<?= htmlspecialchars($old['guardian_contact']??'') ?>"></div>
@@ -427,9 +737,14 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
             </div>
         </div>
 
-        <!-- Address -->
+        <!-- ================= Address ================= -->
         <div class="card">
-            <div class="card-header"><i class="bi bi-geo-alt"></i><h3>Address</h3></div>
+            <div class="card-header">
+                <div class="head-left">
+                    <div class="head-icon"><i class="bi bi-geo-alt"></i></div>
+                    <h3>Address</h3>
+                </div>
+            </div>
             <div class="card-body">
                 <div class="row g-3">
                     <div class="col-md-6"><label class="form-label">Purok/Street</label><input type="text" name="purok_street" class="form-control" value="<?= htmlspecialchars($old['purok_street']??'') ?>"></div>
@@ -443,9 +758,14 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
             </div>
         </div>
 
-        <!-- Enrollment -->
+        <!-- ================= Enrollment ================= -->
         <div class="card">
-            <div class="card-header"><i class="bi bi-mortarboard"></i><h3>Enrollment & Status</h3></div>
+            <div class="card-header">
+                <div class="head-left">
+                    <div class="head-icon"><i class="bi bi-mortarboard"></i></div>
+                    <h3>Enrollment &amp; Status</h3>
+                </div>
+            </div>
             <div class="card-body">
                 <div class="row g-3">
                     <div class="col-md-3"><label class="form-label">Grade Level</label><input type="text" name="grade_level" class="form-control" value="<?= htmlspecialchars($old['grade_level']??'') ?>"></div>
@@ -462,15 +782,31 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
             </div>
         </div>
 
-        <!-- Education -->
+        <!-- ================= Education ================= -->
         <div class="card">
-            <div class="card-header"><i class="bi bi-book"></i><h3>Educational History</h3><button type="button" class="btn btn-primary btn-sm" id="addLevelBtn"><i class="bi bi-plus-lg me-1"></i> Add Level</button></div>
+            <div class="card-header">
+                <div class="head-left">
+                    <div class="head-icon"><i class="bi bi-book"></i></div>
+                    <h3>Educational History</h3>
+                </div>
+                <button type="button" class="btn btn-primary btn-sm" id="addLevelBtn">
+                    <i class="bi bi-plus-lg me-1"></i> Add Level
+                </button>
+            </div>
             <div class="card-body" id="eduContainer">
                 <?php $display_levels = $edu_data;
                 if($_SERVER['REQUEST_METHOD']==='POST'&&isset($_POST['school_name'])){foreach(array_keys($_POST['school_name']) as $l){if(!isset($display_levels[$l]))$display_levels[$l]=['level'=>$l];}}
                 foreach($display_levels as $lvl=>$edu): ?>
                 <div class="edu-block" data-level="<?= htmlspecialchars($lvl) ?>">
-                    <div class="d-flex justify-content-between align-items-center mb-3"><h6 class="fw-bold mb-0" style="color:var(--accent)"><?= htmlspecialchars($lvl) ?></h6><button type="button" class="btn btn-outline-danger btn-xs remove-level-btn"><i class="bi bi-trash3"></i></button></div>
+                    <div class="edu-block-head">
+                        <div class="edu-block-title">
+                            <i class="bi bi-mortarboard-fill"></i>
+                            <?= htmlspecialchars($lvl) ?>
+                        </div>
+                        <button type="button" class="btn btn-outline-danger btn-xs remove-level-btn" title="Remove">
+                            <i class="bi bi-trash3"></i>
+                        </button>
+                    </div>
                     <div class="row g-3">
                         <div class="col-md-5"><label class="form-label">School Name</label><input type="text" name="school_name[<?= htmlspecialchars($lvl) ?>]" class="form-control" value="<?= htmlspecialchars($old['school_name'][$lvl]??$edu['school_name']??'') ?>"></div>
                         <div class="col-md-5"><label class="form-label">Address</label><input type="text" name="school_address[<?= htmlspecialchars($lvl) ?>]" class="form-control" value="<?= htmlspecialchars($old['school_address'][$lvl]??$edu['school_address']??'') ?>"></div>
@@ -481,25 +817,47 @@ $religion_select_value = $religion_is_known ? $current_religion : ($current_reli
             </div>
         </div>
 
-        <div class="d-flex justify-content-end gap-3 mt-4">
-            <a href="view_student.php?id=<?= $student_id ?>" class="btn btn-outline-secondary btn-lg rounded-pill px-4">Cancel</a>
-            <button type="submit" class="btn btn-primary btn-lg rounded-pill px-5" id="submitBtn"><i class="bi bi-check-lg me-2"></i> Save Changes</button>
+        <!-- ================= Actions ================= -->
+        <div class="action-bar">
+            <a href="view_student.php?id=<?= $student_id ?>" class="btn btn-outline-secondary btn-lg">
+                <i class="bi bi-x-lg me-1"></i> Cancel
+            </a>
+            <button type="submit" class="btn btn-primary btn-lg" id="submitBtn">
+                <i class="bi bi-check-lg me-1"></i> Save Changes
+            </button>
         </div>
     </form>
 </div>
 
-<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:199" onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
+<div id="sidebarOverlay" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(2px);z-index:199"
+     onclick="document.getElementById('sidebar').classList.remove('open');this.style.display='none'"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
-const sb=document.getElementById('sidebar'),ov=document.getElementById('sidebarOverlay');
-document.getElementById('menuToggle').addEventListener('click',()=>{sb.classList.toggle('open');ov.style.display=sb.classList.contains('open')?'block':'none'});
-const tb=document.getElementById('themeToggle'),ti=document.getElementById('themeIcon'),h=document.documentElement;
-function st(t){h.setAttribute('data-bs-theme',t);ti.className='bi bi-'+(t==='dark'?'sun-fill':'moon-stars-fill');document.cookie='admin_theme='+t+';path=/;max-age='+60*60*24*365}
-(function(){const m=document.cookie.match(/admin_theme=([^;]+)/);st(m?m[1]:'light')})();
-tb.addEventListener('click',()=>st(h.getAttribute('data-bs-theme')==='dark'?'light':'dark'));
+// ---------- Sidebar ----------
+const sb = document.getElementById('sidebar');
+const ov = document.getElementById('sidebarOverlay');
+document.getElementById('menuToggle').addEventListener('click', () => {
+    sb.classList.toggle('open');
+    ov.style.display = sb.classList.contains('open') ? 'block' : 'none';
+});
 
-// Religion select <-> text input sync
+// ---------- Theme ----------
+const tb = document.getElementById('themeToggle');
+const ti = document.getElementById('themeIcon');
+const h  = document.documentElement;
+function st(t) {
+    h.setAttribute('data-bs-theme', t);
+    ti.className = 'bi bi-' + (t === 'dark' ? 'sun-fill' : 'moon-stars-fill');
+    document.cookie = 'admin_theme=' + t + ';path=/;max-age=' + (60*60*24*365);
+}
+(function () {
+    const m = document.cookie.match(/(?:^|; )admin_theme=([^;]+)/);
+    st(m ? decodeURIComponent(m[1]) : 'light');
+})();
+tb.addEventListener('click', () => st(h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'));
+
+// ---------- Religion select <-> text input sync ----------
 function syncReligion() {
     const sel = document.getElementById('religion_select');
     const inp = document.getElementById('religion_other');
@@ -520,22 +878,105 @@ document.getElementById('religion_other').addEventListener('input', function () 
     document.getElementById('religion_hidden').value = this.value.trim();
 });
 
-// Age calc
-document.getElementById('birth_date').addEventListener('change',function(){const b=new Date(this.value),t=new Date();let a=t.getFullYear()-b.getFullYear();if(t.getMonth()<b.getMonth()||(t.getMonth()===b.getMonth()&&t.getDate()<b.getDate()))a--;document.getElementById('age').value=a>=0?a:''});
+// ---------- Age calc ----------
+document.getElementById('birth_date').addEventListener('change', function () {
+    const b = new Date(this.value), t = new Date();
+    let a = t.getFullYear() - b.getFullYear();
+    if (t.getMonth() < b.getMonth() || (t.getMonth() === b.getMonth() && t.getDate() < b.getDate())) a--;
+    document.getElementById('age').value = a >= 0 ? a : '';
+});
 
-// Strand/Program
-const strands={"Automotive and Small Engine Technologies":["Driving and Automotive Servicing","Automotive Servicing (Electrical Repair)","Automotive Servicing (Engine and Chassis Repairs)"],"Construction and Building Technologies":["Carpentry","Manual Metal Arc Welding"],"ICT Support and Computer Programming Technologies":["Computer Programming (Java)","Computer Programming (.NET)","Computer System Servicing"],"Industrial Technologies":["Electronics Product Assembly and Servicing"],"Agri-Fishery Business and Food Innovation":["Agricultural Crops Production"],"Hospitality and Tourism":["Food and Beverage Operation","Hotel Operation (Housekeeping)"]};
-const ss=document.getElementById('strand'),ps=document.getElementById('program');
-Object.keys(strands).forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;ss.appendChild(o)});
-ss.addEventListener('change',function(){ps.innerHTML='<option value="">Select</option>';if(strands[this.value])strands[this.value].forEach(p=>{const o=document.createElement('option');o.value=p;o.textContent=p;ps.appendChild(o)})});
-const savedS="<?= addslashes($old['strand']??$student['strand']??'') ?>",savedP="<?= addslashes($old['program']??$student['program']??'') ?>";
-if(savedS&&strands[savedS]){ss.value=savedS;ss.dispatchEvent(new Event('change'));setTimeout(()=>{if(savedP)ps.value=savedP},50)}
+// ---------- Strand / Program linkage ----------
+const strands = {
+    "Automotive and Small Engine Technologies": [
+        "Driving and Automotive Servicing",
+        "Automotive Servicing (Electrical Repair)",
+        "Automotive Servicing (Engine and Chassis Repairs)"
+    ],
+    "Construction and Building Technologies": [
+        "Carpentry",
+        "Manual Metal Arc Welding"
+    ],
+    "ICT Support and Computer Programming Technologies": [
+        "Computer Programming (Java)",
+        "Computer Programming (.NET)",
+        "Computer System Servicing"
+    ],
+    "Industrial Technologies": [
+        "Electronics Product Assembly and Servicing"
+    ],
+    "Agri-Fishery Business and Food Innovation": [
+        "Agricultural Crops Production"
+    ],
+    "Hospitality and Tourism": [
+        "Food and Beverage Operation",
+        "Hotel Operation (Housekeeping)"
+    ]
+};
 
-// Add level
-document.getElementById('addLevelBtn').addEventListener('click',()=>{const l=prompt('Level name (e.g. Senior High School):');if(!l)return;if(document.querySelector(`.edu-block[data-level="${l}"]`)){alert('Level exists!');return}
-const t=document.createElement('div');t.className='edu-block';t.setAttribute('data-level',l);t.innerHTML=`<div class="d-flex justify-content-between align-items-center mb-3"><h6 class="fw-bold mb-0" style="color:var(--accent)">${l}</h6><button type="button" class="btn btn-outline-danger btn-xs remove-level-btn"><i class="bi bi-trash3"></i></button></div><div class="row g-3"><div class="col-md-5"><label class="form-label">School Name</label><input type="text" name="school_name[${l}]" class="form-control"></div><div class="col-md-5"><label class="form-label">Address</label><input type="text" name="school_address[${l}]" class="form-control"></div><div class="col-md-2"><label class="form-label">Year</label><input type="text" name="year_completed[${l}]" class="form-control"></div></div>`;document.getElementById('eduContainer').appendChild(t);t.querySelector('.remove-level-btn').addEventListener('click',function(){this.closest('.edu-block').remove()})});
-document.querySelectorAll('.remove-level-btn').forEach(b=>b.addEventListener('click',function(){this.closest('.edu-block').remove()}));
-document.getElementById('editForm').addEventListener('submit',function(){const b=document.getElementById('submitBtn');b.disabled=true;b.innerHTML='<span class="spinner-border spinner-border-sm me-2"></span>Saving...'});
+const ss = document.getElementById('strand');
+const ps = document.getElementById('program');
+Object.keys(strands).forEach(s => {
+    const o = document.createElement('option');
+    o.value = s; o.textContent = s;
+    ss.appendChild(o);
+});
+ss.addEventListener('change', function () {
+    ps.innerHTML = '<option value="">Select</option>';
+    if (strands[this.value]) {
+        strands[this.value].forEach(p => {
+            const o = document.createElement('option');
+            o.value = p; o.textContent = p;
+            ps.appendChild(o);
+        });
+    }
+});
+const savedS = "<?= addslashes($old['strand'] ?? $student['strand'] ?? '') ?>";
+const savedP = "<?= addslashes($old['program'] ?? $student['program'] ?? '') ?>";
+if (savedS && strands[savedS]) {
+    ss.value = savedS;
+    ss.dispatchEvent(new Event('change'));
+    setTimeout(() => { if (savedP) ps.value = savedP; }, 50);
+}
+
+// ---------- Add educational level ----------
+document.getElementById('addLevelBtn').addEventListener('click', () => {
+    const l = prompt('Level name (e.g. Senior High School):');
+    if (!l) return;
+    if (document.querySelector(`.edu-block[data-level="${l}"]`)) { alert('Level exists!'); return; }
+    const t = document.createElement('div');
+    t.className = 'edu-block';
+    t.setAttribute('data-level', l);
+    t.innerHTML = `
+        <div class="edu-block-head">
+            <div class="edu-block-title"><i class="bi bi-mortarboard-fill"></i>${l}</div>
+            <button type="button" class="btn btn-outline-danger btn-xs remove-level-btn" title="Remove"><i class="bi bi-trash3"></i></button>
+        </div>
+        <div class="row g-3">
+            <div class="col-md-5"><label class="form-label">School Name</label><input type="text" name="school_name[${l}]" class="form-control"></div>
+            <div class="col-md-5"><label class="form-label">Address</label><input type="text" name="school_address[${l}]" class="form-control"></div>
+            <div class="col-md-2"><label class="form-label">Year</label><input type="text" name="year_completed[${l}]" class="form-control"></div>
+        </div>`;
+    document.getElementById('eduContainer').appendChild(t);
+    t.querySelector('.remove-level-btn').addEventListener('click', function () {
+        this.closest('.edu-block').remove();
+    });
+});
+
+document.querySelectorAll('.remove-level-btn').forEach(b => {
+    b.addEventListener('click', function () {
+        if (confirm('Remove this educational level?')) {
+            this.closest('.edu-block').remove();
+        }
+    });
+});
+
+// ---------- Submit loading state ----------
+document.getElementById('editForm').addEventListener('submit', function () {
+    const b = document.getElementById('submitBtn');
+    b.disabled = true;
+    b.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Saving...';
+});
 </script>
 </body>
 </html>
